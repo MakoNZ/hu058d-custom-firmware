@@ -1,27 +1,21 @@
 /*
-  HU-058D Custom Firmware v0.02
-  ============================
+  HU-058D Custom Firmware v0.03-dev
+  ===============================
 
   Target:
     ESP-01S / ESP8266EX
     1 MiB flash
     HU-058D clock PCB
 
-  v0.02:
-    - ESP -> STC clock protocol on GPIO2 / Serial1, 9600 8N1
-    - NTP time
-    - automatic New Zealand NZST/NZDT by default
-    - persistent configuration in EEPROM
-    - English web UI available while connected to normal Wi-Fi
-    - Wi-Fi scan / configuration
-    - fallback setup AP if Wi-Fi is not configured or cannot connect
-    - configurable POSIX timezone rule
-    - configurable NTP servers
-    - NTP "sync now"
-    - reboot
-    - reset Wi-Fi
-    - factory reset
-    - status / diagnostics page
+  v0.03-dev:
+    - everything proven in v0.02
+    - browser-based OTA firmware upload
+    - mDNS hostname: hu058d-clock.local
+    - reconnect-Wi-Fi action without erasing credentials
+    - local time, UTC time and Unix epoch diagnostics
+    - expanded firmware / flash / build diagnostics
+
+  Configuration format remains compatible with v0.02.
 
   No external Arduino libraries are required beyond the ESP8266 Arduino core.
 */
@@ -29,6 +23,8 @@
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266HTTPUpdateServer.h>
+#include <ESP8266mDNS.h>
 #include <DNSServer.h>
 #include <EEPROM.h>
 #include <coredecls.h>
@@ -39,7 +35,9 @@
 // -----------------------------------------------------------------------------
 
 static const char *FW_NAME    = "HU-058D Custom Firmware";
-static const char *FW_VERSION = "v0.02";
+static const char *FW_VERSION = "v0.03-dev";
+static const char *FW_BUILD   = __DATE__ " " __TIME__;
+static const char *MDNS_HOST  = "hu058d-clock";
 
 // -----------------------------------------------------------------------------
 // Setup AP
@@ -101,15 +99,18 @@ static DeviceConfig config;
 // -----------------------------------------------------------------------------
 
 static ESP8266WebServer server(80);
+static ESP8266HTTPUpdateServer httpUpdater(true);
 static DNSServer dnsServer;
 
 static bool setupApActive = false;
 static bool ntpEverSynced = false;
+static bool mdnsActive = false;
 
 static time_t lastNtpSyncEpoch = 0;
 static time_t lastPacketEpoch = 0;
 
 static uint32_t restartAtMs = 0;
+static uint32_t wifiReconnectAtMs = 0;
 static uint32_t lastReconnectAttemptMs = 0;
 static uint32_t lastWaitingPacketMs = 0;
 
@@ -308,6 +309,21 @@ static String currentLocalTime()
   }
 
   return formatEpochLocal(now);
+}
+
+static String formatEpochUtc(time_t epoch)
+{
+  if (epoch < MIN_VALID_EPOCH) {
+    return F("Waiting for NTP");
+  }
+
+  struct tm utcTime;
+  gmtime_r(&epoch, &utcTime);
+
+  char buf[40];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &utcTime);
+
+  return String(buf);
 }
 
 static String wifiStatusText(wl_status_t status)
@@ -526,6 +542,40 @@ static bool connectStationWithTimeout(uint32_t timeoutMs)
 }
 
 // -----------------------------------------------------------------------------
+// mDNS
+// -----------------------------------------------------------------------------
+
+static void stopMdns()
+{
+  if (!mdnsActive) {
+    return;
+  }
+
+  MDNS.close();
+  mdnsActive = false;
+  Serial.println(F("mDNS stopped."));
+}
+
+static void startMdns()
+{
+  if (WiFi.status() != WL_CONNECTED || mdnsActive) {
+    return;
+  }
+
+  if (!MDNS.begin(MDNS_HOST)) {
+    Serial.println(F("WARNING: mDNS responder failed to start."));
+    return;
+  }
+
+  MDNS.addService("http", "tcp", 80);
+  mdnsActive = true;
+
+  Serial.print(F("mDNS: http://"));
+  Serial.print(MDNS_HOST);
+  Serial.println(F(".local/"));
+}
+
+// -----------------------------------------------------------------------------
 // HTML
 // -----------------------------------------------------------------------------
 
@@ -616,8 +666,20 @@ static void handleRoot()
 
   html += F("<div class='card'><h2>Clock</h2><div class='grid'>");
 
-  html += F("<div class='k'>Current time</div><div class='v'>");
+  html += F("<div class='k'>Local time</div><div class='v'>");
   html += htmlEscape(currentLocalTime());
+  html += F("</div>");
+
+  html += F("<div class='k'>UTC time</div><div class='v'>");
+  html += htmlEscape(formatEpochUtc(now));
+  html += F("</div>");
+
+  html += F("<div class='k'>Unix epoch</div><div class='v'>");
+  if (timeValid) {
+    html += String(static_cast<uint32_t>(now));
+  } else {
+    html += F("-");
+  }
   html += F("</div>");
 
   html += F("<div class='k'>NTP status</div><div class='v'>");
@@ -657,6 +719,18 @@ static void handleRoot()
   }
   html += F("</div>");
 
+  html += F("<div class='k'>Hostname</div><div class='v'>");
+  if (wifiConnected && mdnsActive) {
+    html += F("<a href='http://");
+    html += MDNS_HOST;
+    html += F(".local/' style='color:var(--accent)'>");
+    html += MDNS_HOST;
+    html += F(".local</a>");
+  } else {
+    html += F("-");
+  }
+  html += F("</div>");
+
   html += F("<div class='k'>Signal</div><div class='v'>");
   if (wifiConnected) {
     html += String(WiFi.RSSI());
@@ -682,6 +756,10 @@ static void handleRoot()
 
   html += F("<div class='k'>Firmware</div><div class='v'>");
   html += FW_VERSION;
+  html += F("</div>");
+
+  html += F("<div class='k'>Build</div><div class='v'>");
+  html += FW_BUILD;
   html += F("</div>");
 
   html += F("<div class='k'>Uptime</div><div class='v'>");
@@ -940,27 +1018,67 @@ static void handleSystemPage()
   html += FW_VERSION;
   html += F("</div>");
 
-  html += F("<div class='k'>Chip ID</div><div class='v'>");
+  html += F("<div class='k'>Build</div><div class='v'>");
+  html += FW_BUILD;
+  html += F("</div>");
+
+  html += F("<div class='k'>ESP8266 core</div><div class='v'>");
+  html += htmlEscape(ESP.getCoreVersion());
+  html += F("</div>");
+
+  html += F("<div class='k'>SDK</div><div class='v'>");
+  html += htmlEscape(String(ESP.getSdkVersion()));
+  html += F("</div>");
+
+  html += F("<div class='k'>Chip ID</div><div class='v'>0x");
   html += String(ESP.getChipId(), HEX);
   html += F("</div>");
 
-  html += F("<div class='k'>Flash size</div><div class='v'>");
+  html += F("<div class='k'>Real flash size</div><div class='v'>");
   html += String(ESP.getFlashChipRealSize());
+  html += F(" bytes</div>");
+
+  html += F("<div class='k'>Configured flash size</div><div class='v'>");
+  html += String(ESP.getFlashChipSize());
+  html += F(" bytes</div>");
+
+  html += F("<div class='k'>Sketch size</div><div class='v'>");
+  html += String(ESP.getSketchSize());
+  html += F(" bytes</div>");
+
+  html += F("<div class='k'>OTA free sketch space</div><div class='v'>");
+  html += String(ESP.getFreeSketchSpace());
   html += F(" bytes</div>");
 
   html += F("<div class='k'>Free heap</div><div class='v'>");
   html += String(ESP.getFreeHeap());
   html += F(" bytes</div>");
 
+  html += F("<div class='k'>Reset reason</div><div class='v'>");
+  html += htmlEscape(ESP.getResetReason());
+  html += F("</div>");
+
   html += F("<div class='k'>Uptime</div><div class='v'>");
   html += htmlEscape(formatUptime());
   html += F("</div></div></div>");
+
+  html += F(
+    "<div class='card'><h2>Firmware update</h2>"
+    "<p>Upload a compiled ESP8266 <code>.bin</code> file over Wi-Fi. "
+    "The clock will reboot automatically after a successful update.</p>"
+    "<p class='hint'>Use the 1MB OTA-capable flash layout when compiling. "
+    "Do not remove power while the upload is in progress.</p>"
+    "<a class='btn' href='/firmware'>Open firmware updater</a>"
+    "</div>"
+  );
 
   html += F(
     "<div class='card'><h2>Actions</h2>"
     "<div class='actions'>"
     "<form class='inline' method='post' action='/system/reboot'>"
     "<button type='submit'>Reboot</button></form>"
+    "<form class='inline' method='post' action='/system/reconnect-wifi'>"
+    "<button class='secondary' type='submit'>Reconnect Wi-Fi</button></form>"
     "<form class='inline' method='post' action='/system/reset-wifi' "
     "onsubmit=\"return confirm('Clear saved Wi-Fi and reboot into setup mode?')\">"
     "<button class='secondary' type='submit'>Reset Wi-Fi</button></form>"
@@ -973,6 +1091,43 @@ static void handleSystemPage()
   sendHtml(html + pageEnd());
 }
 
+static void handleFirmwarePage()
+{
+  String html = pageStart(F("HU-058D Firmware Update"));
+
+  html += F(
+    "<div class='card'><h2>Firmware update</h2>"
+    "<p>Choose a compiled <code>.bin</code> for this HU-058D firmware and upload it.</p>"
+    "<form method='post' action='/update' enctype='multipart/form-data'>"
+    "<label for='update'>Firmware binary</label>"
+    "<input id='update' name='update' type='file' accept='.bin,application/octet-stream' required>"
+    "<div class='actions'>"
+    "<button type='submit' onclick=\"return confirm('Install this firmware and reboot the clock?')\">"
+    "Upload &amp; install</button>"
+    "</div></form>"
+    "<p class='hint'>Current version: "
+  );
+
+  html += FW_VERSION;
+
+  html += F("<br>Current sketch size: ");
+  html += String(ESP.getSketchSize());
+  html += F(" bytes<br>Available OTA sketch space: ");
+  html += String(ESP.getFreeSketchSpace());
+  html += F(" bytes</p></div>");
+
+  html += F(
+    "<div class='card'><h2>Building an OTA image</h2>"
+    "<p>In Arduino IDE use <strong>Sketch &rarr; Export Compiled Binary</strong>, "
+    "then upload the generated <code>.ino.bin</code> file here.</p>"
+    "<p class='hint'>Recommended Flash Size: "
+    "<code>1MB (FS:none OTA:~502KB)</code>. This firmware does not use a filesystem.</p>"
+    "</div>"
+  );
+
+  sendHtml(html + pageEnd());
+}
+
 static void handleReboot()
 {
   sendHtml(pageStart(F("Reboot")) +
@@ -980,6 +1135,25 @@ static void handleReboot()
            pageEnd());
 
   scheduleRestart();
+}
+
+static void handleReconnectWifi()
+{
+  if (!hasSavedWifi()) {
+    sendHtml(pageStart(F("Reconnect Wi-Fi")) +
+             F("<div class='card'><h2>No saved Wi-Fi</h2>"
+               "<p>There is no saved network to reconnect to.</p>"
+               "<a class='btn' href='/wifi'>Configure Wi-Fi</a></div>") +
+             pageEnd(), 400);
+    return;
+  }
+
+  sendHtml(pageStart(F("Reconnect Wi-Fi")) +
+           F("<div class='card'><h2>Reconnecting Wi-Fi</h2>"
+             "<p>The network connection will briefly disappear while the clock reconnects.</p></div>") +
+           pageEnd());
+
+  wifiReconnectAtMs = millis() + 1200UL;
 }
 
 static void handleResetWifi()
@@ -1011,12 +1185,18 @@ static void handleFactoryReset()
 
 static void handleApiStatus()
 {
+  const time_t now = time(nullptr);
+
   String json;
-  json.reserve(600);
+  json.reserve(900);
 
   json += F("{\"firmware\":\"");
   json += FW_VERSION;
-  json += F("\",\"wifi_status\":\"");
+  json += F("\",\"build\":\"");
+  json += jsonEscape(FW_BUILD);
+  json += F("\",\"hostname\":\"");
+  json += MDNS_HOST;
+  json += F(".local\",\"wifi_status\":\"");
   json += jsonEscape(wifiStatusText(WiFi.status()));
   json += F("\",\"ssid\":\"");
   json += jsonEscape(WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String());
@@ -1024,12 +1204,24 @@ static void handleApiStatus()
   json += WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String();
   json += F("\",\"rssi\":");
   json += WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) : String(0);
-  json += F(",\"time\":\"");
+  json += F(",\"local_time\":\"");
   json += jsonEscape(currentLocalTime());
-  json += F("\",\"last_ntp_sync\":\"");
+  json += F("\",\"utc_time\":\"");
+  json += jsonEscape(formatEpochUtc(now));
+  json += F("\",\"unix_time\":");
+  json += now >= MIN_VALID_EPOCH ? String(static_cast<uint32_t>(now)) : String(0);
+  json += F(",\"last_ntp_sync\":\"");
   json += jsonEscape(formatEpochLocal(lastNtpSyncEpoch));
   json += F("\",\"setup_ap\":");
   json += setupApActive ? F("true") : F("false");
+  json += F(",\"mdns\":");
+  json += mdnsActive ? F("true") : F("false");
+  json += F(",\"free_heap\":");
+  json += String(ESP.getFreeHeap());
+  json += F(",\"sketch_size\":");
+  json += String(ESP.getSketchSize());
+  json += F(",\"free_sketch_space\":");
+  json += String(ESP.getFreeSketchSpace());
   json += F(",\"uptime_ms\":");
   json += String(millis());
   json += '}';
@@ -1063,11 +1255,17 @@ static void configureWebServer()
   server.on("/time/sync", HTTP_POST, handleSyncNow);
 
   server.on("/system", HTTP_GET, handleSystemPage);
+  server.on("/firmware", HTTP_GET, handleFirmwarePage);
   server.on("/system/reboot", HTTP_POST, handleReboot);
+  server.on("/system/reconnect-wifi", HTTP_POST, handleReconnectWifi);
   server.on("/system/reset-wifi", HTTP_POST, handleResetWifi);
   server.on("/system/factory-reset", HTTP_POST, handleFactoryReset);
 
   server.on("/api/status", HTTP_GET, handleApiStatus);
+
+  // ESP8266 core-provided browser OTA endpoint.
+  // Our styled /firmware page posts the selected binary to /update.
+  httpUpdater.setup(&server, "/update");
 
   server.on("/favicon.ico", HTTP_GET, []() {
     server.send(204);
@@ -1100,7 +1298,7 @@ void setup()
   const bool configWasValid = loadConfig();
 
   if (!configWasValid) {
-    Serial.println(F("No valid v0.02 configuration found; defaults loaded."));
+    Serial.println(F("No valid configuration found; defaults loaded."));
     saveConfig();
   } else {
     Serial.println(F("Configuration loaded."));
@@ -1122,8 +1320,12 @@ void setup()
   configureWebServer();
 
   if (WiFi.status() == WL_CONNECTED) {
+    startMdns();
     Serial.print(F("Web UI: http://"));
     Serial.println(WiFi.localIP());
+    Serial.print(F("Web UI (mDNS): http://"));
+    Serial.print(MDNS_HOST);
+    Serial.println(F(".local/"));
   } else {
     Serial.println(F("Web UI: http://192.168.4.1"));
     Serial.print(F("Setup AP password: "));
@@ -1139,11 +1341,35 @@ void loop()
     dnsServer.processNextRequest();
   }
 
+  if (mdnsActive && WiFi.status() == WL_CONNECTED) {
+    MDNS.update();
+  }
+
   // Handle a delayed restart so the HTTP response has time to reach the browser.
   if (restartAtMs != 0 &&
       static_cast<int32_t>(millis() - restartAtMs) >= 0) {
     delay(50);
     ESP.restart();
+  }
+
+  // Reconnect Wi-Fi after the HTTP response has had time to leave the device.
+  if (wifiReconnectAtMs != 0 &&
+      static_cast<int32_t>(millis() - wifiReconnectAtMs) >= 0) {
+    wifiReconnectAtMs = 0;
+
+    Serial.println(F("Reconnecting Wi-Fi..."));
+    stopMdns();
+
+    WiFi.disconnect(false);
+    delay(150);
+
+    if (setupApActive) {
+      WiFi.mode(WIFI_AP_STA);
+    } else {
+      WiFi.mode(WIFI_STA);
+    }
+
+    WiFi.begin(config.wifiSsid, config.wifiPassword);
   }
 
   const wl_status_t wifiStatus = WiFi.status();
@@ -1162,6 +1388,11 @@ void loop()
       delay(100);
       stopSetupAp();
     }
+
+    startMdns();
+  } else if (!connectedNow && wasConnected) {
+    Serial.println(F("Wi-Fi disconnected."));
+    stopMdns();
   }
 
   wasConnected = connectedNow;

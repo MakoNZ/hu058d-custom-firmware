@@ -1,0 +1,14 @@
+# Compiled firmware / binaries
+*.bin
+*.elf
+*.hex
+
+# Arduino/build output
+build/
+*.map
+
+# Editor/OS junk
+.vscode/
+.idea/
+.DS_Store
+*~

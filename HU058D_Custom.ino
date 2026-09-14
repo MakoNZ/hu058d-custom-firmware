@@ -1,5 +1,5 @@
 /*
-  HU-058D Custom Firmware v0.03-dev
+  HU-058D Custom Firmware v0.04-dev
   ===============================
 
   Target:
@@ -7,15 +7,17 @@
     1 MiB flash
     HU-058D clock PCB
 
-  v0.03-dev:
-    - everything proven in v0.02
-    - browser-based OTA firmware upload
-    - mDNS hostname: hu058d-clock.local
-    - reconnect-Wi-Fi action without erasing credentials
-    - local time, UTC time and Unix epoch diagnostics
-    - expanded firmware / flash / build diagnostics
+  v0.04-dev:
+    - everything proven in v0.03
+    - NTP time-quality diagnostics
+    - estimated clock correction and oscillator drift
+    - per-server SNTP reachability and resolved IP reporting
+    - NTP sync / observed failed-poll counters
+    - 60-second serial heartbeat plus event-driven serial logging
+    - live-ish Status page updates via /api/status
+    - OTA lifecycle logging
 
-  Configuration format remains compatible with v0.02.
+  Configuration format remains compatible with v0.02/v0.03.
 
   No external Arduino libraries are required beyond the ESP8266 Arduino core.
 */
@@ -25,9 +27,12 @@
 #include <ESP8266WebServer.h>
 #include <ESP8266HTTPUpdateServer.h>
 #include <ESP8266mDNS.h>
+#include <Updater.h>
 #include <DNSServer.h>
 #include <EEPROM.h>
 #include <coredecls.h>
+#include <lwip/apps/sntp.h>
+#include <sys/time.h>
 #include <time.h>
 
 // -----------------------------------------------------------------------------
@@ -35,7 +40,7 @@
 // -----------------------------------------------------------------------------
 
 static const char *FW_NAME    = "HU-058D Custom Firmware";
-static const char *FW_VERSION = "v0.03-dev";
+static const char *FW_VERSION = "v0.04-dev";
 static const char *FW_BUILD   = __DATE__ " " __TIME__;
 static const char *MDNS_HOST  = "hu058d-clock";
 
@@ -67,6 +72,18 @@ static const char *DEFAULT_NTP3 = "time.cloudflare.com";
 
 // Anything older than 2024-01-01 is treated as unsynchronised.
 static const time_t MIN_VALID_EPOCH = 1704067200;
+
+// Diagnostics / logging cadence.
+static const uint32_t SERIAL_HEARTBEAT_INTERVAL_MS = 60000UL;
+static const uint32_t NTP_REACH_SAMPLE_INTERVAL_MS = 5000UL;
+
+// ESP8266 lwIP is configured for three SNTP servers.
+static const uint8_t NTP_SERVER_COUNT = 3;
+
+// The default SNTP refresh interval is one hour. After 75 minutes without a
+// successful update we call the clock "HOLDOVER" rather than pretending the
+// network time source is still current.
+static const uint32_t NTP_HOLDOVER_AFTER_SECONDS = 4500UL;
 
 // -----------------------------------------------------------------------------
 // Persistent configuration
@@ -103,16 +120,35 @@ static ESP8266HTTPUpdateServer httpUpdater(true);
 static DNSServer dnsServer;
 
 static bool setupApActive = false;
-static bool ntpEverSynced = false;
 static bool mdnsActive = false;
 
 static time_t lastNtpSyncEpoch = 0;
 static time_t lastPacketEpoch = 0;
 
+// NTP quality statistics are intentionally runtime-only. They describe the
+// current boot and do not needlessly wear flash by being persisted.
+static uint32_t ntpSyncCount = 0;
+static uint32_t ntpObservedFailureCount = 0;
+static uint8_t ntpReachability[NTP_SERVER_COUNT] = {0, 0, 0};
+static bool ntpReachKnown[NTP_SERVER_COUNT] = {false, false, false};
+static bool ntpPollSeen[NTP_SERVER_COUNT] = {false, false, false};
+static int8_t lastNtpServerIndex = -1;
+
+static uint64_t lastNtpSyncMonoUs = 0;
+static int64_t lastNtpSyncWallUs = 0;
+static uint64_t lastNtpIntervalUs = 0;
+static int64_t lastNtpCorrectionUs = 0;
+static double lastNtpDriftPpm = 0.0;
+static bool ntpQualityValid = false;
+
 static uint32_t restartAtMs = 0;
 static uint32_t wifiReconnectAtMs = 0;
 static uint32_t lastReconnectAttemptMs = 0;
 static uint32_t lastWaitingPacketMs = 0;
+static uint32_t lastHeartbeatMs = 0;
+static uint32_t lastNtpReachSampleMs = 0;
+
+static uint8_t lastOtaLoggedPercent = 0;
 
 // -----------------------------------------------------------------------------
 // Small helpers
@@ -340,6 +376,237 @@ static String wifiStatusText(wl_status_t status)
   }
 }
 
+static void logPrefix(const char *tag)
+{
+  const time_t now = time(nullptr);
+
+  if (now >= MIN_VALID_EPOCH) {
+    struct tm localTime;
+    localtime_r(&now, &localTime);
+
+    char stamp[12];
+    strftime(stamp, sizeof(stamp), "%H:%M:%S", &localTime);
+
+    Serial.printf("[%s] %-5s ", stamp, tag);
+  } else {
+    Serial.printf("[+%06lus] %-5s ",
+                  static_cast<unsigned long>(millis() / 1000UL),
+                  tag);
+  }
+}
+
+static String formatDurationSeconds(uint32_t seconds)
+{
+  const uint32_t days = seconds / 86400UL;
+  seconds %= 86400UL;
+
+  const uint32_t hours = seconds / 3600UL;
+  seconds %= 3600UL;
+
+  const uint32_t minutes = seconds / 60UL;
+  seconds %= 60UL;
+
+  char buf[64];
+
+  if (days > 0) {
+    snprintf(buf, sizeof(buf), "%lu d %02lu:%02lu:%02lu",
+             static_cast<unsigned long>(days),
+             static_cast<unsigned long>(hours),
+             static_cast<unsigned long>(minutes),
+             static_cast<unsigned long>(seconds));
+  } else {
+    snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu",
+             static_cast<unsigned long>(hours),
+             static_cast<unsigned long>(minutes),
+             static_cast<unsigned long>(seconds));
+  }
+
+  return String(buf);
+}
+
+static uint32_t ntpSyncAgeSeconds()
+{
+  if (lastNtpSyncEpoch < MIN_VALID_EPOCH) {
+    return UINT32_MAX;
+  }
+
+  const time_t now = time(nullptr);
+
+  if (now < lastNtpSyncEpoch) {
+    return 0;
+  }
+
+  return static_cast<uint32_t>(now - lastNtpSyncEpoch);
+}
+
+static String ntpStateText()
+{
+  if (lastNtpSyncEpoch < MIN_VALID_EPOCH) {
+    return F("UNSYNCED");
+  }
+
+  const uint32_t age = ntpSyncAgeSeconds();
+
+  if (age == UINT32_MAX) {
+    return F("UNSYNCED");
+  }
+
+  if (age > NTP_HOLDOVER_AFTER_SECONDS) {
+    return F("HOLDOVER");
+  }
+
+  return F("SYNCED");
+}
+
+static String formatNtpCorrection()
+{
+  if (!ntpQualityValid) {
+    return F("Waiting for second sync");
+  }
+
+  const double milliseconds =
+      static_cast<double>(lastNtpCorrectionUs) / 1000.0;
+
+  String out;
+
+  if (milliseconds >= 0.0) {
+    out += '+';
+  }
+
+  out += String(milliseconds, 3);
+  out += F(" ms");
+
+  return out;
+}
+
+static String formatNtpDrift()
+{
+  if (!ntpQualityValid) {
+    return F("Waiting for second sync");
+  }
+
+  String out;
+
+  if (lastNtpDriftPpm >= 0.0) {
+    out += '+';
+  }
+
+  out += String(lastNtpDriftPpm, 3);
+  out += F(" ppm ");
+  out += (lastNtpDriftPpm >= 0.0) ? F("fast") : F("slow");
+
+  return out;
+}
+
+static String formatNtpInterval()
+{
+  if (!ntpQualityValid || lastNtpIntervalUs == 0) {
+    return F("-");
+  }
+
+  return formatDurationSeconds(
+      static_cast<uint32_t>(lastNtpIntervalUs / 1000000ULL));
+}
+
+static uint8_t countBits8(uint8_t value)
+{
+  uint8_t count = 0;
+
+  while (value != 0) {
+    count += value & 1U;
+    value >>= 1;
+  }
+
+  return count;
+}
+
+static String ntpServerName(uint8_t index)
+{
+  if (index >= NTP_SERVER_COUNT) {
+    return F("-");
+  }
+
+  const char *name = sntp_getservername(index);
+
+  if (name != nullptr && name[0] != '\0') {
+    return String(name);
+  }
+
+  return F("-");
+}
+
+static String ntpServerIp(uint8_t index)
+{
+  if (index >= NTP_SERVER_COUNT) {
+    return F("-");
+  }
+
+  const ip_addr_t *address = sntp_getserver(index);
+
+  if (address == nullptr) {
+    return F("-");
+  }
+
+  IPAddress ip = *address;
+
+  if (!ip.isSet()) {
+    return F("-");
+  }
+
+  return ip.toString();
+}
+
+static String ntpReachabilityText(uint8_t index)
+{
+  if (index >= NTP_SERVER_COUNT || !ntpPollSeen[index]) {
+    return F("No observed polls yet");
+  }
+
+  char buf[40];
+
+  snprintf(buf, sizeof(buf), "%u/8 recent successes (0%03o)",
+           static_cast<unsigned int>(countBits8(ntpReachability[index])),
+           static_cast<unsigned int>(ntpReachability[index]));
+
+  return String(buf);
+}
+
+static String ntpServerDisplay(uint8_t index)
+{
+  String out = ntpServerName(index);
+  const String ip = ntpServerIp(index);
+
+  if (ip != F("-")) {
+    out += F(" (");
+    out += ip;
+    out += ')';
+  }
+
+  out += F(" - ");
+  out += ntpReachabilityText(index);
+
+  return out;
+}
+
+static String lastNtpServerDisplay()
+{
+  if (lastNtpServerIndex < 0 ||
+      lastNtpServerIndex >= static_cast<int8_t>(NTP_SERVER_COUNT)) {
+    return F("Unknown");
+  }
+
+  String out = ntpServerName(static_cast<uint8_t>(lastNtpServerIndex));
+  const String ip = ntpServerIp(static_cast<uint8_t>(lastNtpServerIndex));
+
+  if (ip != F("-")) {
+    out += F(" (");
+    out += ip;
+    out += ')';
+  }
+
+  return out;
+}
+
 static void scheduleRestart(uint32_t delayMs = 1500)
 {
   restartAtMs = millis() + delayMs;
@@ -399,25 +666,167 @@ static void sendTimePacket(const struct tm &localTime)
 // Time / SNTP
 // -----------------------------------------------------------------------------
 
+static int8_t sampleNtpReachability(bool successfulSyncContext)
+{
+  int8_t successfulServer = -1;
+
+  for (uint8_t i = 0; i < NTP_SERVER_COUNT; ++i) {
+    const uint8_t current = sntp_getreachability(i);
+
+    if (ntpReachKnown[i]) {
+      const uint8_t previous = ntpReachability[i];
+
+      if (current != previous) {
+        // RFC 5905 reachability is an 8-bit shift register. A normal poll
+        // update is previous<<1 with the newest result in bit 0.
+        const uint8_t shiftedPrevious = static_cast<uint8_t>(previous << 1);
+        const bool looksLikePollUpdate =
+            (current & 0xFEU) == shiftedPrevious;
+
+        if (looksLikePollUpdate) {
+          if ((current & 0x01U) != 0) {
+            successfulServer = static_cast<int8_t>(i);
+          } else {
+            ++ntpObservedFailureCount;
+
+            // Update the cached register before formatting it for the log.
+            ntpReachability[i] = current;
+
+            logPrefix("NTP");
+            Serial.print(F("Observed failed poll: server="));
+            Serial.print(i + 1);
+            Serial.print(F(" name="));
+            Serial.print(ntpServerName(i));
+            Serial.print(F(" reach="));
+            Serial.println(ntpReachabilityText(i));
+          }
+        } else if (successfulSyncContext && (current & 0x01U) != 0) {
+          // A configuration restart can reset the register, so don't call
+          // that a failure. During a known successful callback, bit 0 still
+          // tells us which server most recently answered.
+          successfulServer = static_cast<int8_t>(i);
+        }
+      }
+    } else {
+      ntpReachKnown[i] = true;
+
+      if (successfulSyncContext && (current & 0x01U) != 0) {
+        successfulServer = static_cast<int8_t>(i);
+      }
+    }
+
+    if (current != 0 || (ntpReachKnown[i] && current != ntpReachability[i])) {
+      ntpPollSeen[i] = true;
+    }
+
+    ntpReachability[i] = current;
+  }
+
+  if (successfulSyncContext && successfulServer < 0) {
+    // Fallback for the first callback or any case where the register did not
+    // visibly change between our samples.
+    for (uint8_t i = 0; i < NTP_SERVER_COUNT; ++i) {
+      if ((ntpReachability[i] & 0x01U) != 0) {
+        successfulServer = static_cast<int8_t>(i);
+        break;
+      }
+    }
+  }
+
+  if (successfulServer >= 0) {
+    lastNtpServerIndex = successfulServer;
+  }
+
+  return successfulServer;
+}
+
+static void resetNtpReachabilityTracking()
+{
+  for (uint8_t i = 0; i < NTP_SERVER_COUNT; ++i) {
+    ntpReachability[i] = 0;
+    ntpReachKnown[i] = false;
+    ntpPollSeen[i] = false;
+  }
+
+  lastNtpServerIndex = -1;
+}
+
 static void onTimeSet(bool fromSntp)
 {
   if (!fromSntp) {
     return;
   }
 
-  lastNtpSyncEpoch = time(nullptr);
-  ntpEverSynced = true;
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
 
-  Serial.print(F("NTP synchronised: "));
-  Serial.println(formatEpochLocal(lastNtpSyncEpoch));
+  const uint64_t monoNowUs = micros64();
+  const int64_t wallNowUs =
+      static_cast<int64_t>(tv.tv_sec) * 1000000LL +
+      static_cast<int64_t>(tv.tv_usec);
+
+  if (lastNtpSyncMonoUs != 0 && lastNtpSyncWallUs != 0) {
+    const uint64_t elapsedMonoUs = monoNowUs - lastNtpSyncMonoUs;
+
+    // A tiny interval is not useful for oscillator estimation and can happen
+    // after a manual reconfiguration. Wait at least 60 seconds.
+    if (elapsedMonoUs >= 60000000ULL) {
+      const int64_t predictedWallUs =
+          lastNtpSyncWallUs + static_cast<int64_t>(elapsedMonoUs);
+
+      lastNtpCorrectionUs = wallNowUs - predictedWallUs;
+      lastNtpIntervalUs = elapsedMonoUs;
+
+      // Positive correction means the free-running clock had fallen behind.
+      // Report oscillator drift with the intuitive sign:
+      //   positive ppm = oscillator running fast
+      //   negative ppm = oscillator running slow
+      lastNtpDriftPpm =
+          -static_cast<double>(lastNtpCorrectionUs) * 1000000.0 /
+          static_cast<double>(elapsedMonoUs);
+
+      ntpQualityValid = true;
+    }
+  }
+
+  lastNtpSyncMonoUs = monoNowUs;
+  lastNtpSyncWallUs = wallNowUs;
+  lastNtpSyncEpoch = static_cast<time_t>(tv.tv_sec);
+  ++ntpSyncCount;
+
+  sampleNtpReachability(true);
+
+  logPrefix("NTP");
+  Serial.print(F("Sync #"));
+  Serial.print(ntpSyncCount);
+  Serial.print(F(" time="));
+  Serial.print(formatEpochLocal(lastNtpSyncEpoch));
+
+  if (ntpQualityValid) {
+    Serial.print(F(" correction="));
+    Serial.print(formatNtpCorrection());
+    Serial.print(F(" interval="));
+    Serial.print(formatNtpInterval());
+    Serial.print(F(" drift="));
+    Serial.print(formatNtpDrift());
+  } else {
+    Serial.print(F(" quality=waiting-for-second-sync"));
+  }
+
+  Serial.print(F(" server="));
+  Serial.println(lastNtpServerDisplay());
 }
 
 static void applyTimeConfiguration()
 {
+  resetNtpReachabilityTracking();
+
+  logPrefix("NTP");
   Serial.print(F("Timezone rule: "));
   Serial.println(config.timezone);
 
-  Serial.print(F("NTP servers: "));
+  logPrefix("NTP");
+  Serial.print(F("Servers: "));
   Serial.print(config.ntp1);
   Serial.print(F(", "));
   Serial.print(config.ntp2);
@@ -429,8 +838,68 @@ static void applyTimeConfiguration()
 
 static void requestNtpResync()
 {
-  ntpEverSynced = false;
+  logPrefix("NTP");
+  Serial.println(F("Manual resynchronisation requested."));
+
   applyTimeConfiguration();
+}
+
+static void logHeartbeat()
+{
+  const time_t now = time(nullptr);
+  const uint32_t age = ntpSyncAgeSeconds();
+
+  logPrefix("STAT");
+
+  Serial.print(F("time="));
+  if (now >= MIN_VALID_EPOCH) {
+    struct tm localTime;
+    localtime_r(&now, &localTime);
+
+    char timeBuf[32];
+    strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%dT%H:%M:%S%Z", &localTime);
+    Serial.print(timeBuf);
+  } else {
+    Serial.print(F("unsynchronised"));
+  }
+
+  Serial.print(F(" wifi="));
+  Serial.print(wifiStatusText(WiFi.status()));
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print(F(" rssi="));
+    Serial.print(WiFi.RSSI());
+    Serial.print(F("dBm"));
+  }
+
+  Serial.print(F(" ntp="));
+  Serial.print(ntpStateText());
+
+  Serial.print(F(" ntp_age="));
+  if (age == UINT32_MAX) {
+    Serial.print('-');
+  } else {
+    Serial.print(age);
+    Serial.print('s');
+  }
+
+  Serial.print(F(" syncs="));
+  Serial.print(ntpSyncCount);
+
+  Serial.print(F(" failed_polls="));
+  Serial.print(ntpObservedFailureCount);
+
+  if (ntpQualityValid) {
+    Serial.print(F(" correction="));
+    Serial.print(formatNtpCorrection());
+
+    Serial.print(F(" drift="));
+    Serial.print(formatNtpDrift());
+  }
+
+  Serial.print(F(" heap="));
+  Serial.print(ESP.getFreeHeap());
+  Serial.println(F("B"));
 }
 
 // -----------------------------------------------------------------------------
@@ -452,7 +921,8 @@ static void startStation()
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
 
-  Serial.print(F("Connecting to Wi-Fi SSID: "));
+  logPrefix("WIFI");
+  Serial.print(F("Connecting to SSID="));
   Serial.println(config.wifiSsid);
 
   WiFi.begin(config.wifiSsid, config.wifiPassword);
@@ -464,7 +934,8 @@ static void startSetupAp()
     return;
   }
 
-  Serial.println(F("Starting setup access point..."));
+  logPrefix("AP");
+  Serial.println(F("Starting setup access point."));
 
   if (WiFi.getMode() == WIFI_STA) {
     WiFi.mode(WIFI_AP_STA);
@@ -475,6 +946,7 @@ static void startSetupAp()
   WiFi.softAPConfig(SETUP_AP_IP, SETUP_AP_GW, SETUP_AP_MASK);
 
   if (!WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASSWORD)) {
+    logPrefix("AP");
     Serial.println(F("ERROR: failed to start setup AP."));
     return;
   }
@@ -482,10 +954,10 @@ static void startSetupAp()
   dnsServer.start(53, "*", SETUP_AP_IP);
   setupApActive = true;
 
-  Serial.print(F("Setup AP: "));
-  Serial.println(SETUP_AP_SSID);
-
-  Serial.print(F("Setup AP IP: "));
+  logPrefix("AP");
+  Serial.print(F("Ready SSID="));
+  Serial.print(SETUP_AP_SSID);
+  Serial.print(F(" IP="));
   Serial.println(WiFi.softAPIP());
 }
 
@@ -503,7 +975,9 @@ static void stopSetupAp()
   }
 
   setupApActive = false;
-  Serial.println(F("Setup AP stopped."));
+
+  logPrefix("AP");
+  Serial.println(F("Setup access point stopped."));
 }
 
 static bool connectStationWithTimeout(uint32_t timeoutMs)
@@ -532,12 +1006,17 @@ static bool connectStationWithTimeout(uint32_t timeoutMs)
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.print(F("Wi-Fi connected, IP: "));
-    Serial.println(WiFi.localIP());
+    logPrefix("WIFI");
+    Serial.print(F("Connected IP="));
+    Serial.print(WiFi.localIP());
+    Serial.print(F(" RSSI="));
+    Serial.print(WiFi.RSSI());
+    Serial.println(F(" dBm"));
     return true;
   }
 
-  Serial.println(F("Wi-Fi connection timed out."));
+  logPrefix("WIFI");
+  Serial.println(F("Connection attempt timed out."));
   return false;
 }
 
@@ -553,7 +1032,9 @@ static void stopMdns()
 
   MDNS.close();
   mdnsActive = false;
-  Serial.println(F("mDNS stopped."));
+
+  logPrefix("MDNS");
+  Serial.println(F("Responder stopped."));
 }
 
 static void startMdns()
@@ -563,14 +1044,16 @@ static void startMdns()
   }
 
   if (!MDNS.begin(MDNS_HOST)) {
-    Serial.println(F("WARNING: mDNS responder failed to start."));
+    logPrefix("MDNS");
+    Serial.println(F("WARNING: responder failed to start."));
     return;
   }
 
   MDNS.addService("http", "tcp", 80);
   mdnsActive = true;
 
-  Serial.print(F("mDNS: http://"));
+  logPrefix("MDNS");
+  Serial.print(F("Ready at http://"));
   Serial.print(MDNS_HOST);
   Serial.println(F(".local/"));
 }
@@ -663,32 +1146,24 @@ static void handleRoot()
   const bool wifiConnected = WiFi.status() == WL_CONNECTED;
   const time_t now = time(nullptr);
   const bool timeValid = now >= MIN_VALID_EPOCH;
+  const uint32_t syncAge = ntpSyncAgeSeconds();
 
   html += F("<div class='card'><h2>Clock</h2><div class='grid'>");
 
-  html += F("<div class='k'>Local time</div><div class='v'>");
+  html += F("<div class='k'>Local time</div><div class='v' id='local-time'>");
   html += htmlEscape(currentLocalTime());
   html += F("</div>");
 
-  html += F("<div class='k'>UTC time</div><div class='v'>");
+  html += F("<div class='k'>UTC time</div><div class='v' id='utc-time'>");
   html += htmlEscape(formatEpochUtc(now));
   html += F("</div>");
 
-  html += F("<div class='k'>Unix epoch</div><div class='v'>");
+  html += F("<div class='k'>Unix epoch</div><div class='v' id='unix-time'>");
   if (timeValid) {
     html += String(static_cast<uint32_t>(now));
   } else {
     html += F("-");
   }
-  html += F("</div>");
-
-  html += F("<div class='k'>NTP status</div><div class='v'>");
-  html += timeValid ? F("<span class='ok'>Synchronised</span>")
-                    : F("<span class='bad'>Waiting for NTP</span>");
-  html += F("</div>");
-
-  html += F("<div class='k'>Last NTP sync</div><div class='v'>");
-  html += htmlEscape(formatEpochLocal(lastNtpSyncEpoch));
   html += F("</div>");
 
   html += F("<div class='k'>Timezone rule</div><div class='v'><code>");
@@ -697,9 +1172,68 @@ static void handleRoot()
 
   html += F("</div></div>");
 
+  html += F("<div class='card'><h2>NTP quality</h2><div class='grid'>");
+
+  html += F("<div class='k'>State</div><div class='v' id='ntp-state'>");
+  html += htmlEscape(ntpStateText());
+  html += F("</div>");
+
+  html += F("<div class='k'>Last sync</div><div class='v' id='last-ntp-sync'>");
+  html += htmlEscape(formatEpochLocal(lastNtpSyncEpoch));
+  html += F("</div>");
+
+  html += F("<div class='k'>Sync age</div><div class='v' id='ntp-age'>");
+  if (syncAge == UINT32_MAX) {
+    html += F("-");
+  } else {
+    html += htmlEscape(formatDurationSeconds(syncAge));
+  }
+  html += F("</div>");
+
+  html += F("<div class='k'>Successful syncs</div><div class='v' id='ntp-sync-count'>");
+  html += String(ntpSyncCount);
+  html += F("</div>");
+
+  html += F("<div class='k'>Observed failed polls</div><div class='v' id='ntp-failure-count'>");
+  html += String(ntpObservedFailureCount);
+  html += F("</div>");
+
+  html += F("<div class='k'>Last correction</div><div class='v' id='ntp-correction'>");
+  html += htmlEscape(formatNtpCorrection());
+  html += F("</div>");
+
+  html += F("<div class='k'>Estimated drift</div><div class='v' id='ntp-drift'>");
+  html += htmlEscape(formatNtpDrift());
+  html += F("</div>");
+
+  html += F("<div class='k'>Sync interval</div><div class='v' id='ntp-interval'>");
+  html += htmlEscape(formatNtpInterval());
+  html += F("</div>");
+
+  html += F("<div class='k'>Last server</div><div class='v' id='ntp-last-server'>");
+  html += htmlEscape(lastNtpServerDisplay());
+  html += F("</div>");
+
+  for (uint8_t i = 0; i < NTP_SERVER_COUNT; ++i) {
+    html += F("<div class='k'>Server ");
+    html += String(i + 1);
+    html += F("</div><div class='v' id='ntp-server-");
+    html += String(i);
+    html += F("'>");
+    html += htmlEscape(ntpServerDisplay(i));
+    html += F("</div>");
+  }
+
+  html += F("</div>"
+            "<p class='hint'>Correction and drift are estimated from the ESP8266's "
+            "monotonic clock between successful SNTP updates. They are useful clock-quality "
+            "diagnostics, but they are not raw four-timestamp NTP offset or network-delay measurements. "
+            "The failed-poll counter is based on observable changes in lwIP's reachability registers.</p>"
+            "</div>");
+
   html += F("<div class='card'><h2>Network</h2><div class='grid'>");
 
-  html += F("<div class='k'>Wi-Fi</div><div class='v'>");
+  html += F("<div class='k'>Wi-Fi</div><div class='v' id='wifi-status'>");
   html += htmlEscape(wifiStatusText(WiFi.status()));
   html += F("</div>");
 
@@ -731,7 +1265,7 @@ static void handleRoot()
   }
   html += F("</div>");
 
-  html += F("<div class='k'>Signal</div><div class='v'>");
+  html += F("<div class='k'>Signal</div><div class='v' id='wifi-rssi'>");
   if (wifiConnected) {
     html += String(WiFi.RSSI());
     html += F(" dBm");
@@ -762,15 +1296,60 @@ static void handleRoot()
   html += FW_BUILD;
   html += F("</div>");
 
-  html += F("<div class='k'>Uptime</div><div class='v'>");
+  html += F("<div class='k'>Uptime</div><div class='v' id='uptime'>");
   html += htmlEscape(formatUptime());
   html += F("</div>");
 
-  html += F("<div class='k'>Free heap</div><div class='v'>");
+  html += F("<div class='k'>Free heap</div><div class='v' id='free-heap'>");
   html += String(ESP.getFreeHeap());
   html += F(" bytes</div>");
 
   html += F("</div></div>");
+
+  // Keep the status page useful on a desk without requiring manual refreshes.
+  // A five-second poll is deliberately modest for this tiny ESP8266.
+  html += F(
+    "<script>"
+    "function huFmtDuration(s){"
+      "if(s===null||s===undefined)return '-';"
+      "s=Math.max(0,Math.floor(s));"
+      "const d=Math.floor(s/86400);s%=86400;"
+      "const h=Math.floor(s/3600);s%=3600;"
+      "const m=Math.floor(s/60);const x=s%60;"
+      "const p=n=>String(n).padStart(2,'0');"
+      "return d?d+' d '+p(h)+':'+p(m)+':'+p(x):p(h)+':'+p(m)+':'+p(x);"
+    "}"
+    "function huSet(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}"
+    "async function huRefresh(){"
+      "try{"
+        "const r=await fetch('/api/status',{cache:'no-store'});"
+        "if(!r.ok)return;"
+        "const s=await r.json();"
+        "huSet('local-time',s.local_time);"
+        "huSet('utc-time',s.utc_time);"
+        "huSet('unix-time',s.unix_time||'-');"
+        "huSet('ntp-state',s.ntp_state);"
+        "huSet('last-ntp-sync',s.last_ntp_sync);"
+        "huSet('ntp-age',huFmtDuration(s.ntp_age_s));"
+        "huSet('ntp-sync-count',s.ntp_sync_count);"
+        "huSet('ntp-failure-count',s.ntp_failure_count);"
+        "huSet('ntp-correction',s.ntp_correction);"
+        "huSet('ntp-drift',s.ntp_drift);"
+        "huSet('ntp-interval',s.ntp_interval);"
+        "huSet('ntp-last-server',s.ntp_last_server);"
+        "if(s.ntp_servers){"
+          "s.ntp_servers.forEach((v,i)=>huSet('ntp-server-'+i,v.display));"
+        "}"
+        "huSet('wifi-status',s.wifi_status);"
+        "huSet('wifi-rssi',s.rssi?s.rssi+' dBm':'-');"
+        "huSet('free-heap',s.free_heap+' bytes');"
+        "huSet('uptime',huFmtDuration(Math.floor(s.uptime_ms/1000)));"
+      "}catch(e){}"
+    "}"
+    "setTimeout(huRefresh,1000);"
+    "setInterval(huRefresh,5000);"
+    "</script>"
+  );
 
   sendHtml(html + pageEnd());
 }
@@ -1060,7 +1639,13 @@ static void handleSystemPage()
 
   html += F("<div class='k'>Uptime</div><div class='v'>");
   html += htmlEscape(formatUptime());
-  html += F("</div></div></div>");
+  html += F("</div>");
+
+  html += F("<div class='k'>Serial logging</div><div class='v'>Event log + ");
+  html += String(SERIAL_HEARTBEAT_INTERVAL_MS / 1000UL);
+  html += F(" s heartbeat @ 115200 baud</div>");
+
+  html += F("</div></div>");
 
   html += F(
     "<div class='card'><h2>Firmware update</h2>"
@@ -1186,9 +1771,10 @@ static void handleFactoryReset()
 static void handleApiStatus()
 {
   const time_t now = time(nullptr);
+  const uint32_t syncAge = ntpSyncAgeSeconds();
 
   String json;
-  json.reserve(900);
+  json.reserve(2200);
 
   json += F("{\"firmware\":\"");
   json += FW_VERSION;
@@ -1204,15 +1790,86 @@ static void handleApiStatus()
   json += WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String();
   json += F("\",\"rssi\":");
   json += WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) : String(0);
+
   json += F(",\"local_time\":\"");
   json += jsonEscape(currentLocalTime());
   json += F("\",\"utc_time\":\"");
   json += jsonEscape(formatEpochUtc(now));
   json += F("\",\"unix_time\":");
   json += now >= MIN_VALID_EPOCH ? String(static_cast<uint32_t>(now)) : String(0);
-  json += F(",\"last_ntp_sync\":\"");
+
+  json += F(",\"ntp_state\":\"");
+  json += jsonEscape(ntpStateText());
+  json += F("\",\"last_ntp_sync\":\"");
   json += jsonEscape(formatEpochLocal(lastNtpSyncEpoch));
-  json += F("\",\"setup_ap\":");
+  json += F("\",\"ntp_age_s\":");
+  if (syncAge == UINT32_MAX) {
+    json += F("null");
+  } else {
+    json += String(syncAge);
+  }
+
+  json += F(",\"ntp_sync_count\":");
+  json += String(ntpSyncCount);
+  json += F(",\"ntp_failure_count\":");
+  json += String(ntpObservedFailureCount);
+
+  json += F(",\"ntp_correction\":\"");
+  json += jsonEscape(formatNtpCorrection());
+  json += F("\",\"ntp_drift\":\"");
+  json += jsonEscape(formatNtpDrift());
+  json += F("\",\"ntp_interval\":\"");
+  json += jsonEscape(formatNtpInterval());
+  json += F("\",\"ntp_last_server\":\"");
+  json += jsonEscape(lastNtpServerDisplay());
+  json += F("\"");
+
+  json += F(",\"ntp_correction_ms\":");
+  if (ntpQualityValid) {
+    json += String(static_cast<double>(lastNtpCorrectionUs) / 1000.0, 3);
+  } else {
+    json += F("null");
+  }
+
+  json += F(",\"ntp_drift_ppm\":");
+  if (ntpQualityValid) {
+    json += String(lastNtpDriftPpm, 3);
+  } else {
+    json += F("null");
+  }
+
+  json += F(",\"ntp_interval_s\":");
+  if (ntpQualityValid) {
+    json += String(static_cast<double>(lastNtpIntervalUs) / 1000000.0, 3);
+  } else {
+    json += F("null");
+  }
+
+  json += F(",\"ntp_servers\":[");
+
+  for (uint8_t i = 0; i < NTP_SERVER_COUNT; ++i) {
+    if (i != 0) {
+      json += ',';
+    }
+
+    json += F("{\"index\":");
+    json += String(i);
+    json += F(",\"name\":\"");
+    json += jsonEscape(ntpServerName(i));
+    json += F("\",\"ip\":\"");
+    json += jsonEscape(ntpServerIp(i));
+    json += F("\",\"reach\":");
+    json += String(ntpReachability[i]);
+    json += F(",\"reach_successes\":");
+    json += String(countBits8(ntpReachability[i]));
+    json += F(",\"display\":\"");
+    json += jsonEscape(ntpServerDisplay(i));
+    json += F("\"}");
+  }
+
+  json += F("]");
+
+  json += F(",\"setup_ap\":");
   json += setupApActive ? F("true") : F("false");
   json += F(",\"mdns\":");
   json += mdnsActive ? F("true") : F("false");
@@ -1243,6 +1900,55 @@ static void handleNotFound()
   server.send(404, F("text/plain"), F("Not found"));
 }
 
+static void configureOtaLogging()
+{
+  Update.onStart([]() {
+    lastOtaLoggedPercent = 0;
+
+    logPrefix("OTA");
+    Serial.println(F("Firmware upload started."));
+  });
+
+  Update.onProgress([](size_t current, size_t total) {
+    if (total == 0) {
+      return;
+    }
+
+    const uint8_t percent =
+        static_cast<uint8_t>((current * 100ULL) / total);
+    const uint8_t bucket =
+        static_cast<uint8_t>((percent / 25U) * 25U);
+
+    if (bucket >= 25U && bucket > lastOtaLoggedPercent) {
+      lastOtaLoggedPercent = bucket;
+
+      logPrefix("OTA");
+      Serial.print(F("Progress "));
+      Serial.print(bucket);
+      Serial.print(F("% ("));
+      Serial.print(current);
+      Serial.print('/');
+      Serial.print(total);
+      Serial.println(F(" bytes)"));
+    }
+  });
+
+  Update.onEnd([]() {
+    logPrefix("OTA");
+    Serial.print(F("Firmware write complete: "));
+    Serial.print(Update.progress());
+    Serial.println(F(" bytes; reboot pending."));
+  });
+
+  Update.onError([](uint8_t error) {
+    logPrefix("OTA");
+    Serial.print(F("Update failed: code="));
+    Serial.print(error);
+    Serial.print(F(" reason="));
+    Serial.println(Update.getErrorString());
+  });
+}
+
 static void configureWebServer()
 {
   server.on("/", HTTP_GET, handleRoot);
@@ -1265,6 +1971,7 @@ static void configureWebServer()
 
   // ESP8266 core-provided browser OTA endpoint.
   // Our styled /firmware page posts the selected binary to /update.
+  configureOtaLogging();
   httpUpdater.setup(&server, "/update");
 
   server.on("/favicon.ico", HTTP_GET, []() {
@@ -1274,7 +1981,9 @@ static void configureWebServer()
   server.onNotFound(handleNotFound);
 
   server.begin();
-  Serial.println(F("HTTP server started on port 80."));
+
+  logPrefix("HTTP");
+  Serial.println(F("Web server started on port 80."));
 }
 
 // -----------------------------------------------------------------------------
@@ -1291,12 +2000,21 @@ void setup()
 
   Serial.println();
   Serial.println();
+
+  logPrefix("BOOT");
   Serial.print(FW_NAME);
   Serial.print(' ');
-  Serial.println(FW_VERSION);
+  Serial.print(FW_VERSION);
+  Serial.print(F(" build="));
+  Serial.println(FW_BUILD);
+
+  logPrefix("SYS");
+  Serial.print(F("Reset reason: "));
+  Serial.println(ESP.getResetReason());
 
   const bool configWasValid = loadConfig();
 
+  logPrefix("CFG");
   if (!configWasValid) {
     Serial.println(F("No valid configuration found; defaults loaded."));
     saveConfig();
@@ -1321,16 +2039,26 @@ void setup()
 
   if (WiFi.status() == WL_CONNECTED) {
     startMdns();
+
+    logPrefix("HTTP");
     Serial.print(F("Web UI: http://"));
-    Serial.println(WiFi.localIP());
-    Serial.print(F("Web UI (mDNS): http://"));
+    Serial.print(WiFi.localIP());
+    Serial.print(F("/  mDNS=http://"));
     Serial.print(MDNS_HOST);
     Serial.println(F(".local/"));
   } else {
+    logPrefix("HTTP");
     Serial.println(F("Web UI: http://192.168.4.1"));
-    Serial.print(F("Setup AP password: "));
+
+    logPrefix("AP");
+    Serial.print(F("Setup password: "));
     Serial.println(SETUP_AP_PASSWORD);
   }
+
+  // Start periodic jobs from a clean baseline rather than immediately dumping
+  // a heartbeat as setup() exits.
+  lastHeartbeatMs = millis();
+  lastNtpReachSampleMs = millis();
 }
 
 void loop()
@@ -1348,6 +2076,8 @@ void loop()
   // Handle a delayed restart so the HTTP response has time to reach the browser.
   if (restartAtMs != 0 &&
       static_cast<int32_t>(millis() - restartAtMs) >= 0) {
+    logPrefix("SYS");
+    Serial.println(F("Restarting."));
     delay(50);
     ESP.restart();
   }
@@ -1357,7 +2087,9 @@ void loop()
       static_cast<int32_t>(millis() - wifiReconnectAtMs) >= 0) {
     wifiReconnectAtMs = 0;
 
-    Serial.println(F("Reconnecting Wi-Fi..."));
+    logPrefix("WIFI");
+    Serial.println(F("Manual reconnect starting."));
+
     stopMdns();
 
     WiFi.disconnect(false);
@@ -1374,14 +2106,23 @@ void loop()
 
   const wl_status_t wifiStatus = WiFi.status();
 
-  // If we are in setup/fallback mode and later manage to connect, keep the web
-  // UI on the station interface and stop advertising the setup AP.
+  // Track connection transitions. Initial state is captured without repeating
+  // the successful connection already logged during setup().
+  static bool wifiStateInitialised = false;
   static bool wasConnected = false;
+
   const bool connectedNow = wifiStatus == WL_CONNECTED;
 
-  if (connectedNow && !wasConnected) {
-    Serial.print(F("Wi-Fi connected, IP: "));
-    Serial.println(WiFi.localIP());
+  if (!wifiStateInitialised) {
+    wasConnected = connectedNow;
+    wifiStateInitialised = true;
+  } else if (connectedNow && !wasConnected) {
+    logPrefix("WIFI");
+    Serial.print(F("Connected IP="));
+    Serial.print(WiFi.localIP());
+    Serial.print(F(" RSSI="));
+    Serial.print(WiFi.RSSI());
+    Serial.println(F(" dBm"));
 
     if (setupApActive) {
       // Give any just-completed association a moment to settle.
@@ -1391,7 +2132,10 @@ void loop()
 
     startMdns();
   } else if (!connectedNow && wasConnected) {
-    Serial.println(F("Wi-Fi disconnected."));
+    logPrefix("WIFI");
+    Serial.print(F("Disconnected status="));
+    Serial.println(wifiStatusText(wifiStatus));
+
     stopMdns();
   }
 
@@ -1403,13 +2147,27 @@ void loop()
       millis() - lastReconnectAttemptMs >= 30000UL) {
     lastReconnectAttemptMs = millis();
 
-    Serial.println(F("Retrying Wi-Fi connection..."));
+    logPrefix("WIFI");
+    Serial.println(F("Retrying saved network."));
 
     if (WiFi.getMode() == WIFI_AP) {
       WiFi.mode(WIFI_AP_STA);
     }
 
     WiFi.begin(config.wifiSsid, config.wifiPassword);
+  }
+
+  // Reachability can change on failed SNTP polls without a time-set callback,
+  // so sample the RFC 5905 registers separately.
+  if (millis() - lastNtpReachSampleMs >= NTP_REACH_SAMPLE_INTERVAL_MS) {
+    lastNtpReachSampleMs = millis();
+    sampleNtpReachability(false);
+  }
+
+  // Human-friendly proof of life for a laptop attached to the service UART.
+  if (millis() - lastHeartbeatMs >= SERIAL_HEARTBEAT_INTERVAL_MS) {
+    lastHeartbeatMs = millis();
+    logHeartbeat();
   }
 
   const time_t now = time(nullptr);

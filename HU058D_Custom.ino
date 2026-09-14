@@ -38,7 +38,7 @@
 // -----------------------------------------------------------------------------
 
 static const char *FW_NAME    = "HU-058D Custom Firmware";
-static const char *FW_VERSION = "v0.05-dev";
+static const char *FW_VERSION = "v0.05-dev-ringtest";
 static const char *FW_BUILD   = __DATE__ " " __TIME__;
 static const char *MDNS_HOST  = "hu058d-clock";
 
@@ -82,6 +82,12 @@ static const uint8_t NTP_SERVER_COUNT = 3;
 // not persisted in v0.05 so we can study the data structure and memory behaviour
 // before introducing flash wear and persistent-history migration problems.
 static const uint8_t NTP_HISTORY_CAPACITY = 48;
+
+// TEMPORARY v0.05 ring-buffer rollover test.
+// Synthetic samples are injected locally every 5 seconds. No extra NTP traffic
+// is generated. This entire test block is intended to be reverted after use.
+static const bool NTP_HISTORY_TEST_MODE = true;
+static const uint32_t NTP_HISTORY_TEST_INTERVAL_MS = 5000UL;
 
 // The default SNTP refresh interval is one hour. After 75 minutes without a
 // successful update we call the clock "HOLDOVER" rather than pretending the
@@ -162,6 +168,9 @@ static uint32_t lastReconnectAttemptMs = 0;
 static uint32_t lastWaitingPacketMs = 0;
 static uint32_t lastHeartbeatMs = 0;
 static uint32_t lastNtpReachSampleMs = 0;
+
+static uint32_t lastNtpHistoryTestMs = 0;
+static uint32_t ntpHistoryTestInjected = 0;
 
 static uint8_t lastOtaLoggedPercent = 0;
 
@@ -642,21 +651,20 @@ static const NtpHistorySample &ntpHistoryAt(uint8_t chronologicalIndex)
   return ntpHistory[ntpHistoryPhysicalIndex(chronologicalIndex)];
 }
 
-static void addNtpHistorySample()
+static void storeNtpHistorySample(
+    uint32_t epoch,
+    float correctionMs,
+    float driftPpm,
+    uint32_t intervalSeconds,
+    int8_t serverIndex)
 {
-  if (!ntpQualityValid || lastNtpSyncEpoch < MIN_VALID_EPOCH) {
-    return;
-  }
-
   NtpHistorySample &sample = ntpHistory[ntpHistoryHead];
 
-  sample.epoch = static_cast<uint32_t>(lastNtpSyncEpoch);
-  sample.correctionMs =
-      static_cast<float>(static_cast<double>(lastNtpCorrectionUs) / 1000.0);
-  sample.driftPpm = static_cast<float>(lastNtpDriftPpm);
-  sample.intervalSeconds =
-      static_cast<uint32_t>(lastNtpIntervalUs / 1000000ULL);
-  sample.serverIndex = lastNtpServerIndex;
+  sample.epoch = epoch;
+  sample.correctionMs = correctionMs;
+  sample.driftPpm = driftPpm;
+  sample.intervalSeconds = intervalSeconds;
+  sample.serverIndex = serverIndex;
 
   ntpHistoryHead =
       static_cast<uint8_t>((ntpHistoryHead + 1U) % NTP_HISTORY_CAPACITY);
@@ -666,11 +674,81 @@ static void addNtpHistorySample()
   }
 }
 
+static void addNtpHistorySample()
+{
+  if (!ntpQualityValid || lastNtpSyncEpoch < MIN_VALID_EPOCH) {
+    return;
+  }
+
+  storeNtpHistorySample(
+      static_cast<uint32_t>(lastNtpSyncEpoch),
+      static_cast<float>(
+          static_cast<double>(lastNtpCorrectionUs) / 1000.0),
+      static_cast<float>(lastNtpDriftPpm),
+      static_cast<uint32_t>(lastNtpIntervalUs / 1000000ULL),
+      lastNtpServerIndex);
+}
+
+static void injectNtpHistoryTestSample()
+{
+  if (!NTP_HISTORY_TEST_MODE) {
+    return;
+  }
+
+  const time_t now = time(nullptr);
+  if (now < MIN_VALID_EPOCH) {
+    return;
+  }
+
+  // A 25-point sawtooth gives two obvious wraps in the 48-sample window.
+  const uint8_t phase =
+      static_cast<uint8_t>(ntpHistoryTestInjected % 25UL);
+
+  const float driftPpm = -12.0f + static_cast<float>(phase);
+  const float correctionMs =
+      30.0f - (static_cast<float>(phase) * 2.5f);
+
+  storeNtpHistorySample(
+      static_cast<uint32_t>(now),
+      correctionMs,
+      driftPpm,
+      NTP_HISTORY_TEST_INTERVAL_MS / 1000UL,
+      -2);
+
+  ++ntpHistoryTestInjected;
+
+  logPrefix("HISTTEST");
+  Serial.print(F("injected="));
+  Serial.print(ntpHistoryTestInjected);
+  Serial.print(F(" stored="));
+  Serial.print(ntpHistoryCount);
+  Serial.print('/');
+  Serial.print(NTP_HISTORY_CAPACITY);
+  Serial.print(F(" next_head="));
+  Serial.print(ntpHistoryHead);
+  Serial.print(F(" correction="));
+  if (correctionMs >= 0.0f) {
+    Serial.print('+');
+  }
+  Serial.print(correctionMs, 1);
+  Serial.print(F(" ms drift="));
+  if (driftPpm >= 0.0f) {
+    Serial.print('+');
+  }
+  Serial.print(driftPpm, 1);
+  Serial.println(F(" ppm"));
+}
+
 static void clearNtpHistory()
 {
   memset(ntpHistory, 0, sizeof(ntpHistory));
   ntpHistoryHead = 0;
   ntpHistoryCount = 0;
+
+  if (NTP_HISTORY_TEST_MODE) {
+    ntpHistoryTestInjected = 0;
+    lastNtpHistoryTestMs = millis();
+  }
 
   logPrefix("HIST");
   Serial.println(F("In-RAM NTP history cleared."));
@@ -1539,7 +1617,7 @@ static void handleHistoryPage()
         "});"
       "}catch(e){console.log('history refresh failed',e);}"
     "}"
-    "window.addEventListener('resize',()=>loadHistory());loadHistory();setInterval(loadHistory,60000);"
+    "window.addEventListener('resize',()=>loadHistory());loadHistory();setInterval(loadHistory,5000);"
     "</script>"
   );
 
@@ -2125,6 +2203,8 @@ static void handleApiNtpHistory()
     if (sample.serverIndex >= 0 &&
         sample.serverIndex < static_cast<int8_t>(NTP_SERVER_COUNT)) {
       json += jsonEscape(ntpServerName(static_cast<uint8_t>(sample.serverIndex)));
+    } else if (sample.serverIndex == -2) {
+      json += F("Synthetic test");
     } else {
       json += F("Unknown");
     }
@@ -2314,6 +2394,13 @@ void setup()
   // a heartbeat as setup() exits.
   lastHeartbeatMs = millis();
   lastNtpReachSampleMs = millis();
+  lastNtpHistoryTestMs = millis();
+
+  if (NTP_HISTORY_TEST_MODE) {
+    logPrefix("HISTTEST");
+    Serial.println(
+        F("TEMPORARY synthetic ring-buffer test enabled: one sample every 5s; no extra NTP traffic."));
+  }
 }
 
 void loop()
@@ -2417,6 +2504,15 @@ void loop()
   if (millis() - lastNtpReachSampleMs >= NTP_REACH_SAMPLE_INTERVAL_MS) {
     lastNtpReachSampleMs = millis();
     sampleNtpReachability(false);
+  }
+
+  // TEMPORARY local-only ring-buffer rollover test. This does not contact any
+  // NTP server; it only inserts synthetic samples into the existing history
+  // storage path.
+  if (NTP_HISTORY_TEST_MODE &&
+      millis() - lastNtpHistoryTestMs >= NTP_HISTORY_TEST_INTERVAL_MS) {
+    lastNtpHistoryTestMs = millis();
+    injectNtpHistoryTestSample();
   }
 
   // Human-friendly proof of life for a laptop attached to the service UART.

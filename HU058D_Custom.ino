@@ -1,5 +1,5 @@
 /*
-  HU-058D Custom Firmware v0.04
+  HU-058D Custom Firmware v0.05-dev
   ===============================
 
   Target:
@@ -7,17 +7,15 @@
     1 MiB flash
     HU-058D clock PCB
 
-  v0.04:
-    - everything proven in v0.03
-    - NTP time-quality diagnostics
-    - estimated clock correction and oscillator drift
-    - per-server SNTP reachability and resolved IP reporting
-    - NTP sync / observed failed-poll counters
-    - 60-second serial heartbeat plus event-driven serial logging
-    - live-ish Status page updates via /api/status
-    - OTA lifecycle logging
+  v0.05-dev:
+    - everything proven in v0.04
+    - 48-sample in-RAM NTP quality history ring buffer
+    - lightweight browser-rendered drift and correction graphs
+    - recent-sample table and history summary statistics
+    - /api/ntp-history JSON endpoint
+    - manual in-RAM history clear action
 
-  Configuration format remains compatible with v0.02/v0.03.
+  Configuration format remains compatible with v0.02/v0.03/v0.04.
 
   No external Arduino libraries are required beyond the ESP8266 Arduino core.
 */
@@ -40,7 +38,7 @@
 // -----------------------------------------------------------------------------
 
 static const char *FW_NAME    = "HU-058D Custom Firmware";
-static const char *FW_VERSION = "v0.04";
+static const char *FW_VERSION = "v0.05-dev";
 static const char *FW_BUILD   = __DATE__ " " __TIME__;
 static const char *MDNS_HOST  = "hu058d-clock";
 
@@ -79,6 +77,11 @@ static const uint32_t NTP_REACH_SAMPLE_INTERVAL_MS = 5000UL;
 
 // ESP8266 lwIP is configured for three SNTP servers.
 static const uint8_t NTP_SERVER_COUNT = 3;
+
+// Keep two days of hourly time-quality history in RAM. The buffer is deliberately
+// not persisted in v0.05 so we can study the data structure and memory behaviour
+// before introducing flash wear and persistent-history migration problems.
+static const uint8_t NTP_HISTORY_CAPACITY = 48;
 
 // The default SNTP refresh interval is one hour. After 75 minutes without a
 // successful update we call the clock "HOLDOVER" rather than pretending the
@@ -140,6 +143,18 @@ static uint64_t lastNtpIntervalUs = 0;
 static int64_t lastNtpCorrectionUs = 0;
 static double lastNtpDriftPpm = 0.0;
 static bool ntpQualityValid = false;
+
+struct NtpHistorySample {
+  uint32_t epoch;
+  float correctionMs;
+  float driftPpm;
+  uint32_t intervalSeconds;
+  int8_t serverIndex;
+};
+
+static NtpHistorySample ntpHistory[NTP_HISTORY_CAPACITY];
+static uint8_t ntpHistoryHead = 0;
+static uint8_t ntpHistoryCount = 0;
 
 static uint32_t restartAtMs = 0;
 static uint32_t wifiReconnectAtMs = 0;
@@ -607,6 +622,60 @@ static String lastNtpServerDisplay()
   return out;
 }
 
+static uint8_t ntpHistoryPhysicalIndex(uint8_t chronologicalIndex)
+{
+  if (chronologicalIndex >= ntpHistoryCount) {
+    return 0;
+  }
+
+  const uint8_t oldest =
+      (ntpHistoryCount < NTP_HISTORY_CAPACITY)
+          ? 0
+          : ntpHistoryHead;
+
+  return static_cast<uint8_t>(
+      (oldest + chronologicalIndex) % NTP_HISTORY_CAPACITY);
+}
+
+static const NtpHistorySample &ntpHistoryAt(uint8_t chronologicalIndex)
+{
+  return ntpHistory[ntpHistoryPhysicalIndex(chronologicalIndex)];
+}
+
+static void addNtpHistorySample()
+{
+  if (!ntpQualityValid || lastNtpSyncEpoch < MIN_VALID_EPOCH) {
+    return;
+  }
+
+  NtpHistorySample &sample = ntpHistory[ntpHistoryHead];
+
+  sample.epoch = static_cast<uint32_t>(lastNtpSyncEpoch);
+  sample.correctionMs =
+      static_cast<float>(static_cast<double>(lastNtpCorrectionUs) / 1000.0);
+  sample.driftPpm = static_cast<float>(lastNtpDriftPpm);
+  sample.intervalSeconds =
+      static_cast<uint32_t>(lastNtpIntervalUs / 1000000ULL);
+  sample.serverIndex = lastNtpServerIndex;
+
+  ntpHistoryHead =
+      static_cast<uint8_t>((ntpHistoryHead + 1U) % NTP_HISTORY_CAPACITY);
+
+  if (ntpHistoryCount < NTP_HISTORY_CAPACITY) {
+    ++ntpHistoryCount;
+  }
+}
+
+static void clearNtpHistory()
+{
+  memset(ntpHistory, 0, sizeof(ntpHistory));
+  ntpHistoryHead = 0;
+  ntpHistoryCount = 0;
+
+  logPrefix("HIST");
+  Serial.println(F("In-RAM NTP history cleared."));
+}
+
 static void scheduleRestart(uint32_t delayMs = 1500)
 {
   restartAtMs = millis() + delayMs;
@@ -765,6 +834,8 @@ static void onTimeSet(bool fromSntp)
       static_cast<int64_t>(tv.tv_sec) * 1000000LL +
       static_cast<int64_t>(tv.tv_usec);
 
+  bool qualityUpdatedThisSync = false;
+
   if (lastNtpSyncMonoUs != 0 && lastNtpSyncWallUs != 0) {
     const uint64_t elapsedMonoUs = monoNowUs - lastNtpSyncMonoUs;
 
@@ -786,6 +857,7 @@ static void onTimeSet(bool fromSntp)
           static_cast<double>(elapsedMonoUs);
 
       ntpQualityValid = true;
+      qualityUpdatedThisSync = true;
     }
   }
 
@@ -795,6 +867,10 @@ static void onTimeSet(bool fromSntp)
   ++ntpSyncCount;
 
   sampleNtpReachability(true);
+
+  if (qualityUpdatedThisSync) {
+    addNtpHistorySample();
+  }
 
   logPrefix("NTP");
   Serial.print(F("Sync #"));
@@ -888,6 +964,11 @@ static void logHeartbeat()
 
   Serial.print(F(" failed_polls="));
   Serial.print(ntpObservedFailureCount);
+
+  Serial.print(F(" history="));
+  Serial.print(ntpHistoryCount);
+  Serial.print('/');
+  Serial.print(NTP_HISTORY_CAPACITY);
 
   if (ntpQualityValid) {
     Serial.print(F(" correction="));
@@ -1104,6 +1185,14 @@ static String pageStart(const String &title)
     ".actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}"
     "form.inline{display:inline}"
     "code{overflow-wrap:anywhere}"
+    ".chart-wrap{position:relative;width:100%;height:240px;margin-top:10px}"
+    "canvas.chart{width:100%;height:240px;display:block}"
+    ".summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin:10px 0}"
+    ".metric{border:1px solid var(--border);border-radius:10px;padding:10px}"
+    ".metric .mv{font-size:1.1rem;font-weight:700;margin-top:3px}"
+    "table{width:100%;border-collapse:collapse;font-size:.9rem}"
+    "th,td{text-align:left;padding:7px 6px;border-bottom:1px solid var(--border);white-space:nowrap}"
+    ".table-scroll{overflow-x:auto}"
     "</style></head><body><div class='wrap'>"
   );
 
@@ -1113,6 +1202,7 @@ static String pageStart(const String &title)
             "<a class='btn' href='/'>Status</a>"
             "<a class='btn' href='/wifi'>Wi-Fi</a>"
             "<a class='btn' href='/time'>Time</a>"
+            "<a class='btn' href='/history'>History</a>"
             "<a class='btn' href='/system'>System</a>"
             "</nav>");
 
@@ -1209,6 +1299,12 @@ static void handleRoot()
   html += F("<div class='k'>Sync interval</div><div class='v' id='ntp-interval'>");
   html += htmlEscape(formatNtpInterval());
   html += F("</div>");
+
+  html += F("<div class='k'>History samples</div><div class='v'><span id='ntp-history-count'>");
+  html += String(ntpHistoryCount);
+  html += F("</span> / ");
+  html += String(NTP_HISTORY_CAPACITY);
+  html += F(" <a href='/history' style='color:var(--accent)'>(view graphs)</a></div>");
 
   html += F("<div class='k'>Last server</div><div class='v' id='ntp-last-server'>");
   html += htmlEscape(lastNtpServerDisplay());
@@ -1337,6 +1433,7 @@ static void handleRoot()
         "huSet('ntp-drift',s.ntp_drift);"
         "huSet('ntp-interval',s.ntp_interval);"
         "huSet('ntp-last-server',s.ntp_last_server);"
+        "huSet('ntp-history-count',s.ntp_history_count);"
         "if(s.ntp_servers){"
           "s.ntp_servers.forEach((v,i)=>huSet('ntp-server-'+i,v.display));"
         "}"
@@ -1352,6 +1449,109 @@ static void handleRoot()
   );
 
   sendHtml(html + pageEnd());
+}
+
+static void handleHistoryPage()
+{
+  String html = pageStart(F("HU-058D Time Quality History"));
+
+  html += F(
+    "<div class='card'><h2>Time-quality history</h2>"
+    "<p>Each point is one successful SNTP correction separated from the previous "
+    "sample by at least 60 seconds. History is stored only in RAM and starts fresh after reboot.</p>"
+    "<div class='summary'>"
+      "<div class='metric'><div class='k'>Samples</div><div class='mv' id='hist-count'>-</div></div>"
+      "<div class='metric'><div class='k'>Mean drift</div><div class='mv' id='hist-mean'>-</div></div>"
+      "<div class='metric'><div class='k'>Drift range</div><div class='mv' id='hist-range'>-</div></div>"
+      "<div class='metric'><div class='k'>Latest correction</div><div class='mv' id='hist-latest'>-</div></div>"
+    "</div>"
+    "</div>"
+
+    "<div class='card'><h2>Estimated oscillator drift</h2>"
+    "<div class='chart-wrap'><canvas class='chart' id='drift-chart'></canvas></div>"
+    "<p class='hint'>Positive values mean the ESP8266 free-running clock was fast; negative values mean slow.</p>"
+    "</div>"
+
+    "<div class='card'><h2>NTP clock correction</h2>"
+    "<div class='chart-wrap'><canvas class='chart' id='correction-chart'></canvas></div>"
+    "<p class='hint'>Positive values mean SNTP moved the system clock forward; negative values moved it backward.</p>"
+    "</div>"
+
+    "<div class='card'><h2>Recent samples</h2>"
+    "<div class='table-scroll'><table>"
+    "<thead><tr><th>Time</th><th>Correction</th><th>Drift</th><th>Interval</th><th>Server</th></tr></thead>"
+    "<tbody id='history-rows'><tr><td colspan='5'>Loading...</td></tr></tbody>"
+    "</table></div>"
+    "<form method='post' action='/history/clear' "
+    "onsubmit=\"return confirm('Clear the in-RAM NTP history?')\">"
+    "<div class='actions'><button class='secondary' type='submit'>Clear RAM history</button></div>"
+    "</form></div>"
+
+    "<script>"
+    "function fmtSigned(v,n,u){if(v===null||v===undefined)return '-';return (v>=0?'+':'')+Number(v).toFixed(n)+' '+u;}"
+    "function fmtDur(s){s=Math.max(0,Math.round(s||0));const h=Math.floor(s/3600);s%=3600;const m=Math.floor(s/60);const x=s%60;const p=n=>String(n).padStart(2,'0');return p(h)+':'+p(m)+':'+p(x);}"
+    "function drawChart(id,data,key,unit){"
+      "const c=document.getElementById(id),box=c.parentElement;"
+      "const dpr=window.devicePixelRatio||1,w=Math.max(280,box.clientWidth),h=240;"
+      "c.width=Math.floor(w*dpr);c.height=Math.floor(h*dpr);"
+      "const x=c.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);"
+      "const css=getComputedStyle(document.documentElement);"
+      "const text=css.getPropertyValue('--muted').trim()||'#999';"
+      "const border=css.getPropertyValue('--border').trim()||'#555';"
+      "const accent=css.getPropertyValue('--accent').trim()||'#42a5f5';"
+      "x.clearRect(0,0,w,h);x.font='12px system-ui';x.fillStyle=text;x.strokeStyle=border;x.lineWidth=1;"
+      "if(!data.length){x.fillText('Waiting for NTP history samples...',12,24);return;}"
+      "let vals=data.map(s=>Number(s[key])).filter(Number.isFinite);"
+      "if(!vals.length){x.fillText('No valid samples yet',12,24);return;}"
+      "let lo=Math.min(...vals,0),hi=Math.max(...vals,0);"
+      "if(lo===hi){lo-=1;hi+=1;}const pad=(hi-lo)*0.12||1;lo-=pad;hi+=pad;"
+      "const L=58,R=12,T=14,B=34,pw=w-L-R,ph=h-T-B;"
+      "x.textAlign='right';x.textBaseline='middle';"
+      "for(let i=0;i<=4;i++){const y=T+ph*i/4,val=hi-(hi-lo)*i/4;"
+        "x.strokeStyle=border;x.beginPath();x.moveTo(L,y);x.lineTo(w-R,y);x.stroke();"
+        "x.fillStyle=text;x.fillText(val.toFixed(Math.abs(val)<10?2:1),L-7,y);"
+      "}"
+      "const zeroY=T+(hi/(hi-lo))*ph;if(zeroY>=T&&zeroY<=T+ph){x.strokeStyle=text;x.beginPath();x.moveTo(L,zeroY);x.lineTo(w-R,zeroY);x.stroke();}"
+      "x.strokeStyle=accent;x.lineWidth=2;x.beginPath();"
+      "data.forEach((s,i)=>{const px=L+(data.length===1?pw/2:pw*i/(data.length-1));const val=Number(s[key]);const py=T+(hi-val)/(hi-lo)*ph;if(i===0)x.moveTo(px,py);else x.lineTo(px,py);});x.stroke();"
+      "x.fillStyle=accent;data.forEach((s,i)=>{const px=L+(data.length===1?pw/2:pw*i/(data.length-1));const val=Number(s[key]);const py=T+(hi-val)/(hi-lo)*ph;x.beginPath();x.arc(px,py,2.5,0,Math.PI*2);x.fill();});"
+      "x.fillStyle=text;x.textAlign='left';x.textBaseline='top';"
+      "const first=new Date(data[0].epoch*1000),last=new Date(data[data.length-1].epoch*1000);"
+      "x.fillText(first.toLocaleString(),L,h-B+9);"
+      "x.textAlign='right';x.fillText(last.toLocaleString(),w-R,h-B+9);"
+      "x.save();x.translate(14,T+ph/2);x.rotate(-Math.PI/2);x.textAlign='center';x.fillText(unit,0,0);x.restore();"
+    "}"
+    "async function loadHistory(){"
+      "try{const r=await fetch('/api/ntp-history',{cache:'no-store'});const j=await r.json();const d=j.samples||[];"
+        "document.getElementById('hist-count').textContent=d.length+' / '+j.capacity;"
+        "if(d.length){"
+          "const dr=d.map(s=>Number(s.drift_ppm));const mean=dr.reduce((a,b)=>a+b,0)/dr.length;"
+          "document.getElementById('hist-mean').textContent=fmtSigned(mean,3,'ppm');"
+          "document.getElementById('hist-range').textContent=Math.min(...dr).toFixed(3)+' to '+Math.max(...dr).toFixed(3)+' ppm';"
+          "document.getElementById('hist-latest').textContent=fmtSigned(d[d.length-1].correction_ms,3,'ms');"
+        "}else{document.getElementById('hist-mean').textContent='-';document.getElementById('hist-range').textContent='-';document.getElementById('hist-latest').textContent='-';}"
+        "drawChart('drift-chart',d,'drift_ppm','ppm');drawChart('correction-chart',d,'correction_ms','ms');"
+        "const rows=document.getElementById('history-rows');rows.innerHTML='';"
+        "if(!d.length){rows.innerHTML=\"<tr><td colspan='5'>Waiting for the second suitable NTP sync.</td></tr>\";return;}"
+        "d.slice().reverse().slice(0,12).forEach(s=>{const tr=document.createElement('tr');"
+          "const vals=[new Date(s.epoch*1000).toLocaleString(),fmtSigned(s.correction_ms,3,'ms'),fmtSigned(s.drift_ppm,3,'ppm'),fmtDur(s.interval_s),s.server||'Unknown'];"
+          "vals.forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.appendChild(td);});rows.appendChild(tr);"
+        "});"
+      "}catch(e){console.log('history refresh failed',e);}"
+    "}"
+    "window.addEventListener('resize',()=>loadHistory());loadHistory();setInterval(loadHistory,60000);"
+    "</script>"
+  );
+
+  sendHtml(html + pageEnd());
+}
+
+static void handleHistoryClear()
+{
+  clearNtpHistory();
+
+  server.sendHeader(F("Location"), F("/history"), true);
+  server.send(303, F("text/plain"), F("History cleared"));
 }
 
 static void handleWifiPage()
@@ -1869,6 +2069,11 @@ static void handleApiStatus()
 
   json += F("]");
 
+  json += F(",\"ntp_history_count\":");
+  json += String(ntpHistoryCount);
+  json += F(",\"ntp_history_capacity\":");
+  json += String(NTP_HISTORY_CAPACITY);
+
   json += F(",\"setup_ap\":");
   json += setupApActive ? F("true") : F("false");
   json += F(",\"mdns\":");
@@ -1882,6 +2087,52 @@ static void handleApiStatus()
   json += F(",\"uptime_ms\":");
   json += String(millis());
   json += '}';
+
+  server.sendHeader(F("Cache-Control"), F("no-store"));
+  server.send(200, F("application/json"), json);
+}
+
+static void handleApiNtpHistory()
+{
+  String json;
+  json.reserve(7600);
+
+  json += F("{\"capacity\":");
+  json += String(NTP_HISTORY_CAPACITY);
+  json += F(",\"count\":");
+  json += String(ntpHistoryCount);
+  json += F(",\"samples\":[");
+
+  for (uint8_t i = 0; i < ntpHistoryCount; ++i) {
+    const NtpHistorySample &sample = ntpHistoryAt(i);
+
+    if (i != 0) {
+      json += ',';
+    }
+
+    json += F("{\"epoch\":");
+    json += String(sample.epoch);
+    json += F(",\"correction_ms\":");
+    json += String(sample.correctionMs, 3);
+    json += F(",\"drift_ppm\":");
+    json += String(sample.driftPpm, 3);
+    json += F(",\"interval_s\":");
+    json += String(sample.intervalSeconds);
+    json += F(",\"server_index\":");
+    json += String(static_cast<int>(sample.serverIndex));
+    json += F(",\"server\":\"");
+
+    if (sample.serverIndex >= 0 &&
+        sample.serverIndex < static_cast<int8_t>(NTP_SERVER_COUNT)) {
+      json += jsonEscape(ntpServerName(static_cast<uint8_t>(sample.serverIndex)));
+    } else {
+      json += F("Unknown");
+    }
+
+    json += F("\"}");
+  }
+
+  json += F("]}");
 
   server.sendHeader(F("Cache-Control"), F("no-store"));
   server.send(200, F("application/json"), json);
@@ -1960,6 +2211,9 @@ static void configureWebServer()
   server.on("/time/save", HTTP_POST, handleTimeSave);
   server.on("/time/sync", HTTP_POST, handleSyncNow);
 
+  server.on("/history", HTTP_GET, handleHistoryPage);
+  server.on("/history/clear", HTTP_POST, handleHistoryClear);
+
   server.on("/system", HTTP_GET, handleSystemPage);
   server.on("/firmware", HTTP_GET, handleFirmwarePage);
   server.on("/system/reboot", HTTP_POST, handleReboot);
@@ -1968,6 +2222,7 @@ static void configureWebServer()
   server.on("/system/factory-reset", HTTP_POST, handleFactoryReset);
 
   server.on("/api/status", HTTP_GET, handleApiStatus);
+  server.on("/api/ntp-history", HTTP_GET, handleApiNtpHistory);
 
   // ESP8266 core-provided browser OTA endpoint.
   // Our styled /firmware page posts the selected binary to /update.

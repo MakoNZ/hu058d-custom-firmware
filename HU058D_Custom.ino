@@ -1,5 +1,5 @@
 /*
-  HU-058D Custom Firmware v0.04-dev
+  HU-058D Custom Firmware v0.04
   ===============================
 
   Target:
@@ -7,7 +7,7 @@
     1 MiB flash
     HU-058D clock PCB
 
-  v0.04-dev:
+  v0.04:
     - everything proven in v0.03
     - NTP time-quality diagnostics
     - estimated clock correction and oscillator drift
@@ -40,7 +40,7 @@
 // -----------------------------------------------------------------------------
 
 static const char *FW_NAME    = "HU-058D Custom Firmware";
-static const char *FW_VERSION = "v0.04-dev";
+static const char *FW_VERSION = "v0.04";
 static const char *FW_BUILD   = __DATE__ " " __TIME__;
 static const char *MDNS_HOST  = "hu058d-clock";
 

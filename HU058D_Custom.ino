@@ -1,5 +1,5 @@
 /*
-  HU-058D Custom Firmware v0.05-dev
+  HU-058D Custom Firmware v0.06-dev
   ===============================
 
   Target:
@@ -7,13 +7,12 @@
     1 MiB flash
     HU-058D clock PCB
 
-  v0.05-dev:
-    - everything proven in v0.04
-    - 48-sample in-RAM NTP quality history ring buffer
-    - lightweight browser-rendered drift and correction graphs
-    - recent-sample table and history summary statistics
-    - /api/ntp-history JSON endpoint
-    - manual in-RAM history clear action
+  v0.06-dev:
+    - everything proven in v0.05
+    - diagnostic-only raw four-timestamp NTP probe
+    - NTP offset, network RTT, server processing time, stratum and packet metadata
+    - manual probe page/API; probes never set or adjust the system clock
+    - record the resolved SNTP peer IP with each history sample
 
   Configuration format remains compatible with v0.02/v0.03/v0.04.
 
@@ -22,6 +21,7 @@
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
+#include <WiFiUdp.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266HTTPUpdateServer.h>
 #include <ESP8266mDNS.h>
@@ -38,7 +38,7 @@
 // -----------------------------------------------------------------------------
 
 static const char *FW_NAME    = "HU-058D Custom Firmware";
-static const char *FW_VERSION = "v0.05-dev";
+static const char *FW_VERSION = "v0.06-dev";
 static const char *FW_BUILD   = __DATE__ " " __TIME__;
 static const char *MDNS_HOST  = "hu058d-clock";
 
@@ -74,6 +74,14 @@ static const time_t MIN_VALID_EPOCH = 1704067200;
 // Diagnostics / logging cadence.
 static const uint32_t SERIAL_HEARTBEAT_INTERVAL_MS = 60000UL;
 static const uint32_t NTP_REACH_SAMPLE_INTERVAL_MS = 5000UL;
+
+// The raw NTP probe is manual and diagnostic-only. It sends one UDP request
+// per button press, never adjusts the clock, and has a small local cooldown so
+// an enthusiastic browser finger cannot accidentally become a packet cannon.
+static const uint16_t RAW_NTP_LOCAL_PORT = 2390;
+static const uint32_t RAW_NTP_TIMEOUT_MS = 2500UL;
+static const uint32_t RAW_NTP_MIN_GAP_MS = 5000UL;
+static const uint32_t NTP_UNIX_EPOCH_OFFSET = 2208988800UL;
 
 // ESP8266 lwIP is configured for three SNTP servers.
 static const uint8_t NTP_SERVER_COUNT = 3;
@@ -150,11 +158,65 @@ struct NtpHistorySample {
   float driftPpm;
   uint32_t intervalSeconds;
   int8_t serverIndex;
+  uint8_t serverIp[4];
 };
 
 static NtpHistorySample ntpHistory[NTP_HISTORY_CAPACITY];
 static uint8_t ntpHistoryHead = 0;
 static uint8_t ntpHistoryCount = 0;
+
+enum RawNtpProbeState : uint8_t {
+  RAW_NTP_IDLE = 0,
+  RAW_NTP_WAITING,
+  RAW_NTP_DONE,
+  RAW_NTP_ERROR
+};
+
+enum RawNtpProbeError : uint8_t {
+  RAW_NTP_ERR_NONE = 0,
+  RAW_NTP_ERR_WIFI,
+  RAW_NTP_ERR_TIME,
+  RAW_NTP_ERR_BUSY,
+  RAW_NTP_ERR_COOLDOWN,
+  RAW_NTP_ERR_DNS,
+  RAW_NTP_ERR_UDP,
+  RAW_NTP_ERR_SEND,
+  RAW_NTP_ERR_TIMEOUT
+};
+
+struct RawNtpProbeResult {
+  RawNtpProbeState state;
+  RawNtpProbeError error;
+  uint8_t serverIndex;
+  char host[64];
+  uint8_t ip[4];
+  uint64_t t1Raw;
+  int64_t t1NtpUs;
+  uint64_t t1MonoUs;
+  uint32_t startedMs;
+  uint32_t completedEpoch;
+  bool timingValid;
+  bool originateMatched;
+  uint8_t leap;
+  uint8_t version;
+  uint8_t mode;
+  uint8_t stratum;
+  int8_t pollExponent;
+  int8_t precisionExponent;
+  int64_t offsetUs;
+  int64_t rttUs;
+  int64_t serverProcessingUs;
+  int32_t rootDelayRaw;
+  uint32_t rootDispersionRaw;
+  uint32_t referenceId;
+  uint64_t referenceTimestamp;
+  uint64_t receiveTimestamp;
+  uint64_t transmitTimestamp;
+};
+
+static WiFiUDP rawNtpUdp;
+static RawNtpProbeResult rawNtpProbe = {};
+static uint32_t lastRawNtpProbeStartMs = 0;
 
 static uint32_t restartAtMs = 0;
 static uint32_t wifiReconnectAtMs = 0;
@@ -439,6 +501,207 @@ static String formatDurationSeconds(uint32_t seconds)
   return String(buf);
 }
 
+static const char *configuredNtpServerName(uint8_t index)
+{
+  switch (index) {
+    case 0: return config.ntp1;
+    case 1: return config.ntp2;
+    case 2: return config.ntp3;
+    default: return "";
+  }
+}
+
+static uint32_t readBe32(const uint8_t *p)
+{
+  return (static_cast<uint32_t>(p[0]) << 24) |
+         (static_cast<uint32_t>(p[1]) << 16) |
+         (static_cast<uint32_t>(p[2]) << 8) |
+         static_cast<uint32_t>(p[3]);
+}
+
+static uint64_t readBe64(const uint8_t *p)
+{
+  return (static_cast<uint64_t>(readBe32(p)) << 32) |
+         static_cast<uint64_t>(readBe32(p + 4));
+}
+
+static void writeBe32(uint8_t *p, uint32_t value)
+{
+  p[0] = static_cast<uint8_t>(value >> 24);
+  p[1] = static_cast<uint8_t>(value >> 16);
+  p[2] = static_cast<uint8_t>(value >> 8);
+  p[3] = static_cast<uint8_t>(value);
+}
+
+static void writeBe64(uint8_t *p, uint64_t value)
+{
+  writeBe32(p, static_cast<uint32_t>(value >> 32));
+  writeBe32(p + 4, static_cast<uint32_t>(value));
+}
+
+static uint64_t timevalToNtpTimestamp(const struct timeval &tv)
+{
+  const uint64_t seconds =
+      static_cast<uint64_t>(tv.tv_sec) + NTP_UNIX_EPOCH_OFFSET;
+  const uint64_t fraction =
+      (static_cast<uint64_t>(tv.tv_usec) << 32) / 1000000ULL;
+
+  return (seconds << 32) | (fraction & 0xFFFFFFFFULL);
+}
+
+static int64_t ntpTimestampToUs(uint64_t timestamp)
+{
+  const uint32_t seconds = static_cast<uint32_t>(timestamp >> 32);
+  const uint32_t fraction = static_cast<uint32_t>(timestamp);
+  const uint64_t fractionUs =
+      (static_cast<uint64_t>(fraction) * 1000000ULL) >> 32;
+
+  return static_cast<int64_t>(seconds) * 1000000LL +
+         static_cast<int64_t>(fractionUs);
+}
+
+static String formatNtpTimestampUtc(uint64_t timestamp)
+{
+  if (timestamp == 0) {
+    return F("-");
+  }
+
+  const uint32_t ntpSeconds = static_cast<uint32_t>(timestamp >> 32);
+
+  if (ntpSeconds < NTP_UNIX_EPOCH_OFFSET) {
+    return F("-");
+  }
+
+  const time_t unixSeconds =
+      static_cast<time_t>(ntpSeconds - NTP_UNIX_EPOCH_OFFSET);
+  const uint32_t fraction = static_cast<uint32_t>(timestamp);
+  const uint32_t micros = static_cast<uint32_t>(
+      (static_cast<uint64_t>(fraction) * 1000000ULL) >> 32);
+
+  struct tm utcTime;
+  gmtime_r(&unixSeconds, &utcTime);
+
+  char date[32];
+  char out[48];
+  strftime(date, sizeof(date), "%Y-%m-%d %H:%M:%S", &utcTime);
+  snprintf(out, sizeof(out), "%s.%06lu UTC", date,
+           static_cast<unsigned long>(micros));
+
+  return String(out);
+}
+
+static void storeIpBytes(uint8_t dst[4], const IPAddress &ip)
+{
+  for (uint8_t i = 0; i < 4; ++i) {
+    dst[i] = ip[i];
+  }
+}
+
+static IPAddress ipFromBytes(const uint8_t src[4])
+{
+  return IPAddress(src[0], src[1], src[2], src[3]);
+}
+
+static String ipBytesText(const uint8_t src[4])
+{
+  const IPAddress ip = ipFromBytes(src);
+  return ip.toString();
+}
+
+static String rawNtpStateText()
+{
+  switch (rawNtpProbe.state) {
+    case RAW_NTP_IDLE:    return F("IDLE");
+    case RAW_NTP_WAITING: return F("WAITING");
+    case RAW_NTP_DONE:    return F("DONE");
+    case RAW_NTP_ERROR:   return F("ERROR");
+    default:              return F("UNKNOWN");
+  }
+}
+
+static String rawNtpErrorText()
+{
+  switch (rawNtpProbe.error) {
+    case RAW_NTP_ERR_NONE:     return F("");
+    case RAW_NTP_ERR_WIFI:     return F("Wi-Fi is not connected");
+    case RAW_NTP_ERR_TIME:     return F("System time is not synchronised yet");
+    case RAW_NTP_ERR_BUSY:     return F("A raw NTP probe is already in progress");
+    case RAW_NTP_ERR_COOLDOWN: return F("Please wait a few seconds before probing again");
+    case RAW_NTP_ERR_DNS:      return F("DNS lookup failed");
+    case RAW_NTP_ERR_UDP:      return F("Could not open the diagnostic UDP socket");
+    case RAW_NTP_ERR_SEND:     return F("Could not send the NTP request");
+    case RAW_NTP_ERR_TIMEOUT:  return F("No matching NTP response before timeout");
+    default:                   return F("Unknown probe error");
+  }
+}
+
+static String rawNtpLeapText(uint8_t leap)
+{
+  switch (leap) {
+    case 0: return F("No warning");
+    case 1: return F("Positive leap second pending");
+    case 2: return F("Negative leap second pending");
+    case 3: return F("Server unsynchronised");
+    default: return F("Unknown");
+  }
+}
+
+static String rawNtpModeText(uint8_t mode)
+{
+  switch (mode) {
+    case 1: return F("Symmetric active");
+    case 2: return F("Symmetric passive");
+    case 3: return F("Client");
+    case 4: return F("Server");
+    case 5: return F("Broadcast");
+    default: return String(F("Mode ")) + String(mode);
+  }
+}
+
+static String rawNtpReferenceIdText()
+{
+  char hex[16];
+  snprintf(hex, sizeof(hex), "0x%08lX",
+           static_cast<unsigned long>(rawNtpProbe.referenceId));
+
+  const char chars[5] = {
+    static_cast<char>((rawNtpProbe.referenceId >> 24) & 0xFF),
+    static_cast<char>((rawNtpProbe.referenceId >> 16) & 0xFF),
+    static_cast<char>((rawNtpProbe.referenceId >> 8) & 0xFF),
+    static_cast<char>(rawNtpProbe.referenceId & 0xFF),
+    '\0'
+  };
+
+  bool printable = true;
+  for (uint8_t i = 0; i < 4; ++i) {
+    if (chars[i] < 32 || chars[i] > 126) {
+      printable = false;
+      break;
+    }
+  }
+
+  String out = hex;
+  if (printable) {
+    out += F(" ('");
+    out += chars;
+    out += F("')");
+  }
+
+  return out;
+}
+
+static double rawNtpRootDelayMs()
+{
+  return static_cast<double>(rawNtpProbe.rootDelayRaw) *
+         1000.0 / 65536.0;
+}
+
+static double rawNtpRootDispersionMs()
+{
+  return static_cast<double>(rawNtpProbe.rootDispersionRaw) *
+         1000.0 / 65536.0;
+}
+
 static uint32_t ntpSyncAgeSeconds()
 {
   if (lastNtpSyncEpoch < MIN_VALID_EPOCH) {
@@ -657,6 +920,20 @@ static void addNtpHistorySample()
   sample.intervalSeconds =
       static_cast<uint32_t>(lastNtpIntervalUs / 1000000ULL);
   sample.serverIndex = lastNtpServerIndex;
+  memset(sample.serverIp, 0, sizeof(sample.serverIp));
+
+  if (lastNtpServerIndex >= 0 &&
+      lastNtpServerIndex < static_cast<int8_t>(NTP_SERVER_COUNT)) {
+    const ip_addr_t *address =
+        sntp_getserver(static_cast<uint8_t>(lastNtpServerIndex));
+
+    if (address != nullptr) {
+      const IPAddress ip = *address;
+      if (ip.isSet()) {
+        storeIpBytes(sample.serverIp, ip);
+      }
+    }
+  }
 
   ntpHistoryHead =
       static_cast<uint8_t>((ntpHistoryHead + 1U) % NTP_HISTORY_CAPACITY);
@@ -891,6 +1168,233 @@ static void onTimeSet(bool fromSntp)
 
   Serial.print(F(" server="));
   Serial.println(lastNtpServerDisplay());
+}
+
+static void setRawNtpProbeError(RawNtpProbeError error, uint8_t serverIndex)
+{
+  rawNtpUdp.stop();
+  rawNtpProbe = {};
+  rawNtpProbe.state = RAW_NTP_ERROR;
+  rawNtpProbe.error = error;
+  rawNtpProbe.serverIndex = serverIndex;
+
+  const char *host = configuredNtpServerName(serverIndex);
+  copyText(rawNtpProbe.host, sizeof(rawNtpProbe.host), host);
+
+  logPrefix("NTPR");
+  Serial.print(F("Probe error: "));
+  Serial.println(rawNtpErrorText());
+}
+
+static bool startRawNtpProbe(uint8_t serverIndex)
+{
+  if (serverIndex >= NTP_SERVER_COUNT) {
+    return false;
+  }
+
+  if (rawNtpProbe.state == RAW_NTP_WAITING) {
+    logPrefix("NTPR");
+    Serial.println(F("Probe request ignored: another probe is already running."));
+    return false;
+  }
+
+  const uint32_t nowMs = millis();
+
+  if (lastRawNtpProbeStartMs != 0 &&
+      static_cast<uint32_t>(nowMs - lastRawNtpProbeStartMs) < RAW_NTP_MIN_GAP_MS) {
+    setRawNtpProbeError(RAW_NTP_ERR_COOLDOWN, serverIndex);
+    return false;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    setRawNtpProbeError(RAW_NTP_ERR_WIFI, serverIndex);
+    return false;
+  }
+
+  if (time(nullptr) < MIN_VALID_EPOCH) {
+    setRawNtpProbeError(RAW_NTP_ERR_TIME, serverIndex);
+    return false;
+  }
+
+  const char *host = configuredNtpServerName(serverIndex);
+
+  if (host == nullptr || host[0] == '\0') {
+    setRawNtpProbeError(RAW_NTP_ERR_DNS, serverIndex);
+    return false;
+  }
+
+  IPAddress targetIp;
+  if (WiFi.hostByName(host, targetIp) != 1 || !targetIp.isSet()) {
+    setRawNtpProbeError(RAW_NTP_ERR_DNS, serverIndex);
+    return false;
+  }
+
+  rawNtpUdp.stop();
+  if (!rawNtpUdp.begin(RAW_NTP_LOCAL_PORT)) {
+    setRawNtpProbeError(RAW_NTP_ERR_UDP, serverIndex);
+    return false;
+  }
+
+  uint8_t packet[48] = {0};
+
+  // LI=0, VN=4, Mode=3 (client). Poll=6 and precision=-20 are descriptive
+  // client fields; the server response supplies the values we actually study.
+  packet[0] = 0x23;
+  packet[2] = 6;
+  packet[3] = static_cast<uint8_t>(-20);
+
+  if (!rawNtpUdp.beginPacket(targetIp, 123)) {
+    setRawNtpProbeError(RAW_NTP_ERR_SEND, serverIndex);
+    return false;
+  }
+
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  const uint64_t monoNowUs = micros64();
+  const uint64_t t1Raw = timevalToNtpTimestamp(tv);
+  const int64_t t1NtpUs = ntpTimestampToUs(t1Raw);
+  writeBe64(packet + 40, t1Raw);
+
+  const size_t written = rawNtpUdp.write(packet, sizeof(packet));
+  const bool sent = written == sizeof(packet) && rawNtpUdp.endPacket() == 1;
+
+  if (!sent) {
+    setRawNtpProbeError(RAW_NTP_ERR_SEND, serverIndex);
+    return false;
+  }
+
+  rawNtpProbe = {};
+  rawNtpProbe.state = RAW_NTP_WAITING;
+  rawNtpProbe.error = RAW_NTP_ERR_NONE;
+  rawNtpProbe.serverIndex = serverIndex;
+  copyText(rawNtpProbe.host, sizeof(rawNtpProbe.host), host);
+  storeIpBytes(rawNtpProbe.ip, targetIp);
+  rawNtpProbe.t1Raw = t1Raw;
+  rawNtpProbe.t1NtpUs = t1NtpUs;
+  rawNtpProbe.t1MonoUs = monoNowUs;
+  rawNtpProbe.startedMs = nowMs;
+  lastRawNtpProbeStartMs = nowMs;
+
+  logPrefix("NTPR");
+  Serial.print(F("Probe sent server="));
+  Serial.print(serverIndex + 1);
+  Serial.print(F(" host="));
+  Serial.print(rawNtpProbe.host);
+  Serial.print(F(" ip="));
+  Serial.println(targetIp);
+
+  return true;
+}
+
+static void serviceRawNtpProbe()
+{
+  if (rawNtpProbe.state != RAW_NTP_WAITING) {
+    return;
+  }
+
+  const int packetSize = rawNtpUdp.parsePacket();
+
+  if (packetSize > 0) {
+    const uint64_t receiveMonoUs = micros64();
+    const IPAddress remoteIp = rawNtpUdp.remoteIP();
+    const IPAddress expectedIp = ipFromBytes(rawNtpProbe.ip);
+    const uint16_t remotePort = rawNtpUdp.remotePort();
+
+    uint8_t packet[48] = {0};
+    const int bytesRead = rawNtpUdp.read(packet, sizeof(packet));
+    while (rawNtpUdp.available()) {
+      rawNtpUdp.read();
+    }
+
+    // Ignore unrelated datagrams. Matching the source, mode and echoed
+    // originate timestamp keeps a stray UDP packet from becoming a result.
+    if (!(remoteIp == expectedIp) || remotePort != 123 || bytesRead < 48) {
+      return;
+    }
+
+    const uint8_t leap = packet[0] >> 6;
+    const uint8_t version = (packet[0] >> 3) & 0x07U;
+    const uint8_t mode = packet[0] & 0x07U;
+    const uint64_t originate = readBe64(packet + 24);
+
+    if (mode != 4 || version < 3 || originate != rawNtpProbe.t1Raw) {
+      return;
+    }
+
+    rawNtpProbe.leap = leap;
+    rawNtpProbe.version = version;
+    rawNtpProbe.mode = mode;
+    rawNtpProbe.stratum = packet[1];
+    rawNtpProbe.pollExponent = static_cast<int8_t>(packet[2]);
+    rawNtpProbe.precisionExponent = static_cast<int8_t>(packet[3]);
+    rawNtpProbe.rootDelayRaw = static_cast<int32_t>(readBe32(packet + 4));
+    rawNtpProbe.rootDispersionRaw = readBe32(packet + 8);
+    rawNtpProbe.referenceId = readBe32(packet + 12);
+    rawNtpProbe.referenceTimestamp = readBe64(packet + 16);
+    rawNtpProbe.receiveTimestamp = readBe64(packet + 32);
+    rawNtpProbe.transmitTimestamp = readBe64(packet + 40);
+    rawNtpProbe.originateMatched = true;
+    rawNtpProbe.completedEpoch = static_cast<uint32_t>(time(nullptr));
+
+    const bool usableServer =
+        rawNtpProbe.stratum >= 1 && rawNtpProbe.stratum <= 15 && leap != 3;
+    const bool usableTimestamps =
+        rawNtpProbe.receiveTimestamp != 0 && rawNtpProbe.transmitTimestamp != 0;
+
+    rawNtpProbe.timingValid = usableServer && usableTimestamps;
+
+    if (rawNtpProbe.timingValid) {
+      const int64_t t2Us = ntpTimestampToUs(rawNtpProbe.receiveTimestamp);
+      const int64_t t3Us = ntpTimestampToUs(rawNtpProbe.transmitTimestamp);
+      const int64_t elapsedLocalUs = static_cast<int64_t>(
+          receiveMonoUs - rawNtpProbe.t1MonoUs);
+      const int64_t t4Us = rawNtpProbe.t1NtpUs + elapsedLocalUs;
+
+      rawNtpProbe.serverProcessingUs = t3Us - t2Us;
+      rawNtpProbe.rttUs = elapsedLocalUs - rawNtpProbe.serverProcessingUs;
+      rawNtpProbe.offsetUs =
+          ((t2Us - rawNtpProbe.t1NtpUs) + (t3Us - t4Us)) / 2LL;
+    }
+
+    rawNtpProbe.state = RAW_NTP_DONE;
+    rawNtpProbe.error = RAW_NTP_ERR_NONE;
+    rawNtpUdp.stop();
+
+    logPrefix("NTPR");
+    Serial.print(F("Reply server="));
+    Serial.print(rawNtpProbe.serverIndex + 1);
+    Serial.print(F(" host="));
+    Serial.print(rawNtpProbe.host);
+    Serial.print(F(" ip="));
+    Serial.print(expectedIp);
+    Serial.print(F(" stratum="));
+    Serial.print(rawNtpProbe.stratum);
+
+    if (rawNtpProbe.timingValid) {
+      Serial.print(F(" offset="));
+      if (rawNtpProbe.offsetUs >= 0) {
+        Serial.print('+');
+      }
+      Serial.print(static_cast<double>(rawNtpProbe.offsetUs) / 1000.0, 3);
+      Serial.print(F(" ms rtt="));
+      Serial.print(static_cast<double>(rawNtpProbe.rttUs) / 1000.0, 3);
+      Serial.print(F(" ms server_proc="));
+      Serial.print(static_cast<double>(rawNtpProbe.serverProcessingUs) / 1000.0, 3);
+      Serial.print(F(" ms"));
+    } else {
+      Serial.print(F(" timing=not-usable"));
+    }
+
+    Serial.print(F(" refid="));
+    Serial.println(rawNtpReferenceIdText());
+    return;
+  }
+
+  if (static_cast<uint32_t>(millis() - rawNtpProbe.startedMs) >=
+      RAW_NTP_TIMEOUT_MS) {
+    const uint8_t serverIndex = rawNtpProbe.serverIndex;
+    setRawNtpProbeError(RAW_NTP_ERR_TIMEOUT, serverIndex);
+  }
 }
 
 static void applyTimeConfiguration()
@@ -1203,6 +1707,7 @@ static String pageStart(const String &title)
             "<a class='btn' href='/wifi'>Wi-Fi</a>"
             "<a class='btn' href='/time'>Time</a>"
             "<a class='btn' href='/history'>History</a>"
+            "<a class='btn' href='/probe'>NTP Probe</a>"
             "<a class='btn' href='/system'>System</a>"
             "</nav>");
 
@@ -1462,6 +1967,7 @@ static void handleHistoryPage()
     "<div class='summary'>"
       "<div class='metric'><div class='k'>Samples</div><div class='mv' id='hist-count'>-</div></div>"
       "<div class='metric'><div class='k'>Mean drift</div><div class='mv' id='hist-mean'>-</div></div>"
+      "<div class='metric'><div class='k'>Weighted drift</div><div class='mv' id='hist-weighted'>-</div></div>"
       "<div class='metric'><div class='k'>Drift range</div><div class='mv' id='hist-range'>-</div></div>"
       "<div class='metric'><div class='k'>Latest correction</div><div class='mv' id='hist-latest'>-</div></div>"
     "</div>"
@@ -1469,7 +1975,7 @@ static void handleHistoryPage()
 
     "<div class='card'><h2>Estimated oscillator drift</h2>"
     "<div class='chart-wrap'><canvas class='chart' id='drift-chart'></canvas></div>"
-    "<p class='hint'>Positive values mean the ESP8266 free-running clock was fast; negative values mean slow.</p>"
+    "<p class='hint'>Positive values mean the ESP8266 free-running clock was fast; negative values mean slow. Weighted drift uses the net correction over the total measured interval, so it is less misleading when sample intervals differ.</p>"
     "</div>"
 
     "<div class='card'><h2>NTP clock correction</h2>"
@@ -1479,8 +1985,8 @@ static void handleHistoryPage()
 
     "<div class='card'><h2>Recent samples</h2>"
     "<div class='table-scroll'><table>"
-    "<thead><tr><th>Time</th><th>Correction</th><th>Drift</th><th>Interval</th><th>Server</th></tr></thead>"
-    "<tbody id='history-rows'><tr><td colspan='5'>Loading...</td></tr></tbody>"
+    "<thead><tr><th>Time</th><th>Correction</th><th>Drift</th><th>Interval</th><th>Server</th><th>Peer IP</th></tr></thead>"
+    "<tbody id='history-rows'><tr><td colspan='6'>Loading...</td></tr></tbody>"
     "</table></div>"
     "<form method='post' action='/history/clear' "
     "onsubmit=\"return confirm('Clear the in-RAM NTP history?')\">"
@@ -1527,14 +2033,16 @@ static void handleHistoryPage()
         "if(d.length){"
           "const dr=d.map(s=>Number(s.drift_ppm));const mean=dr.reduce((a,b)=>a+b,0)/dr.length;"
           "document.getElementById('hist-mean').textContent=fmtSigned(mean,3,'ppm');"
+          "const totalS=d.reduce((a,s)=>a+Number(s.interval_s||0),0),totalC=d.reduce((a,s)=>a+Number(s.correction_ms||0),0);"
+          "document.getElementById('hist-weighted').textContent=totalS?fmtSigned(-totalC*1000/totalS,3,'ppm'):'-';"
           "document.getElementById('hist-range').textContent=Math.min(...dr).toFixed(3)+' to '+Math.max(...dr).toFixed(3)+' ppm';"
           "document.getElementById('hist-latest').textContent=fmtSigned(d[d.length-1].correction_ms,3,'ms');"
-        "}else{document.getElementById('hist-mean').textContent='-';document.getElementById('hist-range').textContent='-';document.getElementById('hist-latest').textContent='-';}"
+        "}else{document.getElementById('hist-mean').textContent='-';document.getElementById('hist-weighted').textContent='-';document.getElementById('hist-range').textContent='-';document.getElementById('hist-latest').textContent='-';}"
         "drawChart('drift-chart',d,'drift_ppm','ppm');drawChart('correction-chart',d,'correction_ms','ms');"
         "const rows=document.getElementById('history-rows');rows.innerHTML='';"
-        "if(!d.length){rows.innerHTML=\"<tr><td colspan='5'>Waiting for the second suitable NTP sync.</td></tr>\";return;}"
+        "if(!d.length){rows.innerHTML=\"<tr><td colspan='6'>Waiting for the second suitable NTP sync.</td></tr>\";return;}"
         "d.slice().reverse().slice(0,12).forEach(s=>{const tr=document.createElement('tr');"
-          "const vals=[new Date(s.epoch*1000).toLocaleString(),fmtSigned(s.correction_ms,3,'ms'),fmtSigned(s.drift_ppm,3,'ppm'),fmtDur(s.interval_s),s.server||'Unknown'];"
+          "const vals=[new Date(s.epoch*1000).toLocaleString(),fmtSigned(s.correction_ms,3,'ms'),fmtSigned(s.drift_ppm,3,'ppm'),fmtDur(s.interval_s),s.server||'Unknown',s.server_ip||'-'];"
           "vals.forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.appendChild(td);});rows.appendChild(tr);"
         "});"
       "}catch(e){console.log('history refresh failed',e);}"
@@ -1552,6 +2060,186 @@ static void handleHistoryClear()
 
   server.sendHeader(F("Location"), F("/history"), true);
   server.send(303, F("text/plain"), F("History cleared"));
+}
+
+static void handleRawNtpProbePage()
+{
+  String html = pageStart(F("HU-058D Raw NTP Probe"));
+  html.reserve(8200);
+
+  html += F(
+    "<div class='card'><h2>Raw four-timestamp NTP probe</h2>"
+    "<p>This is a diagnostic-only NTP client. A button press sends exactly one UDP "
+    "request to the selected configured server. It does not set the clock, restart "
+    "SNTP, or change the normal hourly synchronisation schedule.</p>"
+    "<p class='hint'>Offset uses the standard four timestamps T1/T2/T3/T4. Network RTT "
+    "uses the ESP8266 monotonic timer for the local elapsed interval. Because packet "
+    "receipt is noticed by the main event loop rather than hardware timestamping, the "
+    "RTT and offset are useful diagnostics rather than laboratory measurements.</p>"
+    "</div>"
+    "<div class='card'><h2>Probe a configured server</h2>"
+  );
+
+  for (uint8_t i = 0; i < NTP_SERVER_COUNT; ++i) {
+    const char *host = configuredNtpServerName(i);
+
+    html += F("<form class='inline' method='post' action='/probe/start'>"
+              "<button type='submit' name='server' value='");
+    html += String(i);
+    html += F("'>Probe ");
+    html += String(i + 1);
+    html += F("</button></form> <code>");
+    html += htmlEscape(String((host != nullptr && host[0] != '\0') ? host : "(empty)"));
+    html += F("</code><br><br>");
+  }
+
+  html += F(
+    "</div>"
+    "<div class='card'><h2>Last probe</h2><div class='grid'>"
+    "<div class='k'>State</div><div class='v' id='rp-state'>-</div>"
+    "<div class='k'>Error</div><div class='v' id='rp-error'>-</div>"
+    "<div class='k'>Server</div><div class='v' id='rp-server'>-</div>"
+    "<div class='k'>Peer IP</div><div class='v' id='rp-ip'>-</div>"
+    "<div class='k'>Offset</div><div class='v' id='rp-offset'>-</div>"
+    "<div class='k'>Network RTT</div><div class='v' id='rp-rtt'>-</div>"
+    "<div class='k'>Server processing</div><div class='v' id='rp-processing'>-</div>"
+    "<div class='k'>Stratum</div><div class='v' id='rp-stratum'>-</div>"
+    "<div class='k'>Leap indicator</div><div class='v' id='rp-leap'>-</div>"
+    "<div class='k'>NTP version / mode</div><div class='v' id='rp-version'>-</div>"
+    "<div class='k'>Poll exponent</div><div class='v' id='rp-poll'>-</div>"
+    "<div class='k'>Precision exponent</div><div class='v' id='rp-precision'>-</div>"
+    "<div class='k'>Root delay</div><div class='v' id='rp-root-delay'>-</div>"
+    "<div class='k'>Root dispersion</div><div class='v' id='rp-root-disp'>-</div>"
+    "<div class='k'>Reference ID</div><div class='v' id='rp-refid'>-</div>"
+    "<div class='k'>Reference timestamp</div><div class='v' id='rp-ref-time'>-</div>"
+    "<div class='k'>Server receive (T2)</div><div class='v' id='rp-t2'>-</div>"
+    "<div class='k'>Server transmit (T3)</div><div class='v' id='rp-t3'>-</div>"
+    "<div class='k'>Originate match</div><div class='v' id='rp-origin'>-</div>"
+    "<div class='k'>Completed</div><div class='v' id='rp-completed'>-</div>"
+    "</div>"
+    "<p class='hint'>A positive offset means the NTP server says the ESP clock is behind; "
+    "a negative offset means the ESP clock is ahead. This is not the same quantity as "
+    "the hourly correction shown on the History page.</p></div>"
+    "<script>"
+    "function put(id,v){const e=document.getElementById(id);if(e)e.textContent=(v===null||v===undefined||v==='')?'-':v;}"
+    "function ms(v,signed){if(v===null||v===undefined)return '-';return (signed&&Number(v)>=0?'+':'')+Number(v).toFixed(3)+' ms';}"
+    "async function loadProbe(){try{const r=await fetch('/api/ntp-probe',{cache:'no-store'});const p=await r.json();"
+      "put('rp-state',p.state);put('rp-error',p.error);put('rp-server',p.server);put('rp-ip',p.ip);"
+      "put('rp-offset',p.timing_valid?ms(p.offset_ms,true):'-');"
+      "put('rp-rtt',p.timing_valid?ms(p.rtt_ms,false):'-');"
+      "put('rp-processing',p.timing_valid?ms(p.server_processing_ms,false):'-');"
+      "put('rp-stratum',p.has_reply?p.stratum:'-');put('rp-leap',p.has_reply?p.leap:'-');"
+      "put('rp-version',p.has_reply?('v'+p.version+' / '+p.mode):'-');"
+      "put('rp-poll',p.has_reply?p.poll_exponent:'-');put('rp-precision',p.has_reply?p.precision_exponent:'-');"
+      "put('rp-root-delay',p.has_reply?ms(p.root_delay_ms,false):'-');put('rp-root-disp',p.has_reply?ms(p.root_dispersion_ms,false):'-');"
+      "put('rp-refid',p.has_reply?p.reference_id:'-');put('rp-ref-time',p.has_reply?p.reference_time_utc:'-');"
+      "put('rp-t2',p.has_reply?p.receive_time_utc:'-');put('rp-t3',p.has_reply?p.transmit_time_utc:'-');"
+      "put('rp-origin',p.has_reply?(p.originate_match?'Matched':'MISMATCH'):'-');put('rp-completed',p.completed_utc);"
+    "}catch(e){}}loadProbe();setInterval(loadProbe,1000);"
+    "</script>"
+  );
+
+  sendHtml(html + pageEnd());
+}
+
+static void handleRawNtpProbeStart()
+{
+  if (!server.hasArg(F("server"))) {
+    sendHtml(pageStart(F("NTP Probe Error")) +
+             F("<div class='card'><h2>Missing server</h2>"
+               "<a class='btn' href='/probe'>Back</a></div>") +
+             pageEnd(), 400);
+    return;
+  }
+
+  const int requested = server.arg(F("server")).toInt();
+
+  if (requested < 0 || requested >= static_cast<int>(NTP_SERVER_COUNT)) {
+    sendHtml(pageStart(F("NTP Probe Error")) +
+             F("<div class='card'><h2>Invalid server</h2>"
+               "<a class='btn' href='/probe'>Back</a></div>") +
+             pageEnd(), 400);
+    return;
+  }
+
+  startRawNtpProbe(static_cast<uint8_t>(requested));
+
+  server.sendHeader(F("Location"), F("/probe"), true);
+  server.send(303, F("text/plain"), F("Probe requested"));
+}
+
+static void handleApiRawNtpProbe()
+{
+  String json;
+  json.reserve(1500);
+
+  const bool hasReply = rawNtpProbe.state == RAW_NTP_DONE;
+
+  json += F("{\"state\":\"");
+  json += jsonEscape(rawNtpStateText());
+  json += F("\",\"error\":\"");
+  json += jsonEscape(rawNtpErrorText());
+  json += F("\",\"server_index\":");
+  json += String(rawNtpProbe.serverIndex);
+  json += F(",\"server\":\"");
+  if (rawNtpProbe.host[0] != '\0') {
+    json += jsonEscape(String(rawNtpProbe.host));
+  }
+  json += F("\",\"ip\":\"");
+  if (rawNtpProbe.ip[0] != 0 || rawNtpProbe.ip[1] != 0 ||
+      rawNtpProbe.ip[2] != 0 || rawNtpProbe.ip[3] != 0) {
+    json += ipBytesText(rawNtpProbe.ip);
+  }
+  json += F("\",\"has_reply\":");
+  json += hasReply ? F("true") : F("false");
+  json += F(",\"timing_valid\":");
+  json += rawNtpProbe.timingValid ? F("true") : F("false");
+
+  if (rawNtpProbe.timingValid) {
+    json += F(",\"offset_ms\":");
+    json += String(static_cast<double>(rawNtpProbe.offsetUs) / 1000.0, 3);
+    json += F(",\"rtt_ms\":");
+    json += String(static_cast<double>(rawNtpProbe.rttUs) / 1000.0, 3);
+    json += F(",\"server_processing_ms\":");
+    json += String(static_cast<double>(rawNtpProbe.serverProcessingUs) / 1000.0, 3);
+  } else {
+    json += F(",\"offset_ms\":null,\"rtt_ms\":null,\"server_processing_ms\":null");
+  }
+
+  json += F(",\"stratum\":");
+  json += String(rawNtpProbe.stratum);
+  json += F(",\"leap\":\"");
+  json += hasReply ? jsonEscape(rawNtpLeapText(rawNtpProbe.leap)) : String();
+  json += F("\",\"version\":");
+  json += String(rawNtpProbe.version);
+  json += F(",\"mode\":\"");
+  json += hasReply ? jsonEscape(rawNtpModeText(rawNtpProbe.mode)) : String();
+  json += F("\",\"poll_exponent\":");
+  json += String(static_cast<int>(rawNtpProbe.pollExponent));
+  json += F(",\"precision_exponent\":");
+  json += String(static_cast<int>(rawNtpProbe.precisionExponent));
+  json += F(",\"root_delay_ms\":");
+  json += hasReply ? String(rawNtpRootDelayMs(), 3) : String(F("null"));
+  json += F(",\"root_dispersion_ms\":");
+  json += hasReply ? String(rawNtpRootDispersionMs(), 3) : String(F("null"));
+  json += F(",\"reference_id\":\"");
+  json += hasReply ? jsonEscape(rawNtpReferenceIdText()) : String();
+  json += F("\",\"reference_time_utc\":\"");
+  json += hasReply ? jsonEscape(formatNtpTimestampUtc(rawNtpProbe.referenceTimestamp)) : String();
+  json += F("\",\"receive_time_utc\":\"");
+  json += hasReply ? jsonEscape(formatNtpTimestampUtc(rawNtpProbe.receiveTimestamp)) : String();
+  json += F("\",\"transmit_time_utc\":\"");
+  json += hasReply ? jsonEscape(formatNtpTimestampUtc(rawNtpProbe.transmitTimestamp)) : String();
+  json += F("\",\"originate_match\":");
+  json += rawNtpProbe.originateMatched ? F("true") : F("false");
+  json += F(",\"completed_utc\":\"");
+  if (rawNtpProbe.completedEpoch >= static_cast<uint32_t>(MIN_VALID_EPOCH)) {
+    json += jsonEscape(formatEpochUtc(static_cast<time_t>(rawNtpProbe.completedEpoch)));
+  }
+  json += F("\"}");
+
+  server.sendHeader(F("Cache-Control"), F("no-store"));
+  server.send(200, F("application/json"), json);
 }
 
 static void handleWifiPage()
@@ -2095,7 +2783,7 @@ static void handleApiStatus()
 static void handleApiNtpHistory()
 {
   String json;
-  json.reserve(7600);
+  json.reserve(9000);
 
   json += F("{\"capacity\":");
   json += String(NTP_HISTORY_CAPACITY);
@@ -2129,6 +2817,11 @@ static void handleApiNtpHistory()
       json += F("Unknown");
     }
 
+    json += F("\",\"server_ip\":\"");
+    const IPAddress sampleIp = ipFromBytes(sample.serverIp);
+    if (sampleIp.isSet()) {
+      json += sampleIp.toString();
+    }
     json += F("\"}");
   }
 
@@ -2214,6 +2907,9 @@ static void configureWebServer()
   server.on("/history", HTTP_GET, handleHistoryPage);
   server.on("/history/clear", HTTP_POST, handleHistoryClear);
 
+  server.on("/probe", HTTP_GET, handleRawNtpProbePage);
+  server.on("/probe/start", HTTP_POST, handleRawNtpProbeStart);
+
   server.on("/system", HTTP_GET, handleSystemPage);
   server.on("/firmware", HTTP_GET, handleFirmwarePage);
   server.on("/system/reboot", HTTP_POST, handleReboot);
@@ -2223,6 +2919,7 @@ static void configureWebServer()
 
   server.on("/api/status", HTTP_GET, handleApiStatus);
   server.on("/api/ntp-history", HTTP_GET, handleApiNtpHistory);
+  server.on("/api/ntp-probe", HTTP_GET, handleApiRawNtpProbe);
 
   // ESP8266 core-provided browser OTA endpoint.
   // Our styled /firmware page posts the selected binary to /update.
@@ -2319,6 +3016,7 @@ void setup()
 void loop()
 {
   server.handleClient();
+  serviceRawNtpProbe();
 
   if (setupApActive) {
     dnsServer.processNextRequest();

@@ -12,6 +12,7 @@
     - diagnostic-only raw four-timestamp NTP probe
     - NTP offset, network RTT, server processing time, stratum and packet metadata
     - manual probe page/API; probes never set or adjust the system clock
+    - optional no-sleep probe mode to test ESP8266 Wi-Fi sleep latency
     - record the resolved SNTP peer IP with each history sample
 
   Configuration format remains compatible with v0.02/v0.03/v0.04.
@@ -81,6 +82,9 @@ static const uint32_t NTP_REACH_SAMPLE_INTERVAL_MS = 5000UL;
 static const uint16_t RAW_NTP_LOCAL_PORT = 2390;
 static const uint32_t RAW_NTP_TIMEOUT_MS = 2500UL;
 static const uint32_t RAW_NTP_MIN_GAP_MS = 5000UL;
+// Give the radio a moment to settle after temporarily disabling Wi-Fi sleep.
+// This delay happens before T1 is captured, so it is not part of the RTT.
+static const uint32_t RAW_NTP_NO_SLEEP_SETTLE_MS = 250UL;
 static const uint32_t NTP_UNIX_EPOCH_OFFSET = 2208988800UL;
 
 // ESP8266 lwIP is configured for three SNTP servers.
@@ -180,6 +184,7 @@ enum RawNtpProbeError : uint8_t {
   RAW_NTP_ERR_COOLDOWN,
   RAW_NTP_ERR_DNS,
   RAW_NTP_ERR_UDP,
+  RAW_NTP_ERR_WIFI_SLEEP,
   RAW_NTP_ERR_SEND,
   RAW_NTP_ERR_TIMEOUT
 };
@@ -197,6 +202,12 @@ struct RawNtpProbeResult {
   uint32_t completedEpoch;
   bool timingValid;
   bool originateMatched;
+  bool noSleepRequested;
+  bool sleepOverrideApplied;
+  bool sleepRestoreSucceeded;
+  uint8_t wifiSleepBefore;
+  uint8_t wifiSleepDuring;
+  uint8_t wifiSleepAfter;
   uint8_t leap;
   uint8_t version;
   uint8_t mode;
@@ -217,6 +228,8 @@ struct RawNtpProbeResult {
 static WiFiUDP rawNtpUdp;
 static RawNtpProbeResult rawNtpProbe = {};
 static uint32_t lastRawNtpProbeStartMs = 0;
+static bool rawNtpSleepOverrideActive = false;
+static WiFiSleepType_t rawNtpSavedSleepMode = WIFI_MODEM_SLEEP;
 
 static uint32_t restartAtMs = 0;
 static uint32_t wifiReconnectAtMs = 0;
@@ -627,12 +640,28 @@ static String rawNtpErrorText()
     case RAW_NTP_ERR_TIME:     return F("System time is not synchronised yet");
     case RAW_NTP_ERR_BUSY:     return F("A raw NTP probe is already in progress");
     case RAW_NTP_ERR_COOLDOWN: return F("Please wait a few seconds before probing again");
-    case RAW_NTP_ERR_DNS:      return F("DNS lookup failed");
-    case RAW_NTP_ERR_UDP:      return F("Could not open the diagnostic UDP socket");
-    case RAW_NTP_ERR_SEND:     return F("Could not send the NTP request");
+    case RAW_NTP_ERR_DNS:        return F("DNS lookup failed");
+    case RAW_NTP_ERR_UDP:        return F("Could not open the diagnostic UDP socket");
+    case RAW_NTP_ERR_WIFI_SLEEP: return F("Could not change the Wi-Fi sleep mode");
+    case RAW_NTP_ERR_SEND:       return F("Could not send the NTP request");
     case RAW_NTP_ERR_TIMEOUT:  return F("No matching NTP response before timeout");
     default:                   return F("Unknown probe error");
   }
+}
+
+static String wifiSleepModeText(WiFiSleepType_t mode)
+{
+  switch (mode) {
+    case WIFI_NONE_SLEEP:  return F("NONE");
+    case WIFI_LIGHT_SLEEP: return F("LIGHT");
+    case WIFI_MODEM_SLEEP: return F("MODEM");
+    default:               return F("UNKNOWN");
+  }
+}
+
+static String wifiSleepModeText(uint8_t mode)
+{
+  return wifiSleepModeText(static_cast<WiFiSleepType_t>(mode));
 }
 
 static String rawNtpLeapText(uint8_t leap)
@@ -1170,23 +1199,46 @@ static void onTimeSet(bool fromSntp)
   Serial.println(lastNtpServerDisplay());
 }
 
+static void restoreRawNtpProbeWifiSleep()
+{
+  if (!rawNtpSleepOverrideActive) {
+    rawNtpProbe.wifiSleepAfter = static_cast<uint8_t>(WiFi.getSleepMode());
+    return;
+  }
+
+  const bool restored = WiFi.setSleepMode(rawNtpSavedSleepMode);
+  rawNtpSleepOverrideActive = false;
+  rawNtpProbe.sleepRestoreSucceeded = restored;
+  rawNtpProbe.wifiSleepAfter = static_cast<uint8_t>(WiFi.getSleepMode());
+
+  logPrefix("NTPR");
+  Serial.print(F("Wi-Fi sleep restore requested="));
+  Serial.print(wifiSleepModeText(rawNtpSavedSleepMode));
+  Serial.print(F(" actual="));
+  Serial.print(wifiSleepModeText(rawNtpProbe.wifiSleepAfter));
+  Serial.print(F(" result="));
+  Serial.println(restored ? F("ok") : F("FAILED"));
+}
+
 static void setRawNtpProbeError(RawNtpProbeError error, uint8_t serverIndex)
 {
   rawNtpUdp.stop();
-  rawNtpProbe = {};
+  restoreRawNtpProbeWifiSleep();
   rawNtpProbe.state = RAW_NTP_ERROR;
   rawNtpProbe.error = error;
   rawNtpProbe.serverIndex = serverIndex;
 
-  const char *host = configuredNtpServerName(serverIndex);
-  copyText(rawNtpProbe.host, sizeof(rawNtpProbe.host), host);
+  if (rawNtpProbe.host[0] == '\0') {
+    const char *host = configuredNtpServerName(serverIndex);
+    copyText(rawNtpProbe.host, sizeof(rawNtpProbe.host), host);
+  }
 
   logPrefix("NTPR");
   Serial.print(F("Probe error: "));
   Serial.println(rawNtpErrorText());
 }
 
-static bool startRawNtpProbe(uint8_t serverIndex)
+static bool startRawNtpProbe(uint8_t serverIndex, bool noSleepRequested)
 {
   if (serverIndex >= NTP_SERVER_COUNT) {
     return false;
@@ -1198,7 +1250,22 @@ static bool startRawNtpProbe(uint8_t serverIndex)
     return false;
   }
 
+  // A completed/error probe should already have restored its Wi-Fi mode. This
+  // is deliberately defensive before starting a fresh result structure.
+  restoreRawNtpProbeWifiSleep();
+  rawNtpUdp.stop();
+
   const uint32_t nowMs = millis();
+  const char *host = configuredNtpServerName(serverIndex);
+  const WiFiSleepType_t sleepBefore = WiFi.getSleepMode();
+
+  rawNtpProbe = {};
+  rawNtpProbe.serverIndex = serverIndex;
+  rawNtpProbe.noSleepRequested = noSleepRequested;
+  rawNtpProbe.wifiSleepBefore = static_cast<uint8_t>(sleepBefore);
+  rawNtpProbe.wifiSleepDuring = static_cast<uint8_t>(sleepBefore);
+  rawNtpProbe.wifiSleepAfter = static_cast<uint8_t>(sleepBefore);
+  copyText(rawNtpProbe.host, sizeof(rawNtpProbe.host), host);
 
   if (lastRawNtpProbeStartMs != 0 &&
       static_cast<uint32_t>(nowMs - lastRawNtpProbeStartMs) < RAW_NTP_MIN_GAP_MS) {
@@ -1216,8 +1283,6 @@ static bool startRawNtpProbe(uint8_t serverIndex)
     return false;
   }
 
-  const char *host = configuredNtpServerName(serverIndex);
-
   if (host == nullptr || host[0] == '\0') {
     setRawNtpProbeError(RAW_NTP_ERR_DNS, serverIndex);
     return false;
@@ -1233,6 +1298,29 @@ static bool startRawNtpProbe(uint8_t serverIndex)
   if (!rawNtpUdp.begin(RAW_NTP_LOCAL_PORT)) {
     setRawNtpProbeError(RAW_NTP_ERR_UDP, serverIndex);
     return false;
+  }
+
+  if (noSleepRequested) {
+    rawNtpSavedSleepMode = sleepBefore;
+
+    if (!WiFi.setSleepMode(WIFI_NONE_SLEEP)) {
+      setRawNtpProbeError(RAW_NTP_ERR_WIFI_SLEEP, serverIndex);
+      return false;
+    }
+
+    rawNtpSleepOverrideActive = true;
+    rawNtpProbe.sleepOverrideApplied = true;
+
+    // Let the change settle before capturing T1. The diagnostic interval then
+    // contains only the actual request/response exchange.
+    delay(RAW_NTP_NO_SLEEP_SETTLE_MS);
+    rawNtpProbe.wifiSleepDuring = static_cast<uint8_t>(WiFi.getSleepMode());
+
+    if (static_cast<WiFiSleepType_t>(rawNtpProbe.wifiSleepDuring) !=
+        WIFI_NONE_SLEEP) {
+      setRawNtpProbeError(RAW_NTP_ERR_WIFI_SLEEP, serverIndex);
+      return false;
+    }
   }
 
   uint8_t packet[48] = {0};
@@ -1263,17 +1351,14 @@ static bool startRawNtpProbe(uint8_t serverIndex)
     return false;
   }
 
-  rawNtpProbe = {};
   rawNtpProbe.state = RAW_NTP_WAITING;
   rawNtpProbe.error = RAW_NTP_ERR_NONE;
-  rawNtpProbe.serverIndex = serverIndex;
-  copyText(rawNtpProbe.host, sizeof(rawNtpProbe.host), host);
   storeIpBytes(rawNtpProbe.ip, targetIp);
   rawNtpProbe.t1Raw = t1Raw;
   rawNtpProbe.t1NtpUs = t1NtpUs;
   rawNtpProbe.t1MonoUs = monoNowUs;
-  rawNtpProbe.startedMs = nowMs;
-  lastRawNtpProbeStartMs = nowMs;
+  rawNtpProbe.startedMs = millis();
+  lastRawNtpProbeStartMs = rawNtpProbe.startedMs;
 
   logPrefix("NTPR");
   Serial.print(F("Probe sent server="));
@@ -1281,7 +1366,16 @@ static bool startRawNtpProbe(uint8_t serverIndex)
   Serial.print(F(" host="));
   Serial.print(rawNtpProbe.host);
   Serial.print(F(" ip="));
-  Serial.println(targetIp);
+  Serial.print(targetIp);
+  Serial.print(F(" mode="));
+  Serial.print(noSleepRequested ? F("no-sleep") : F("normal"));
+  Serial.print(F(" wifi_sleep="));
+  Serial.print(wifiSleepModeText(rawNtpProbe.wifiSleepBefore));
+  if (noSleepRequested) {
+    Serial.print(F("->"));
+    Serial.print(wifiSleepModeText(rawNtpProbe.wifiSleepDuring));
+  }
+  Serial.println();
 
   return true;
 }
@@ -1359,6 +1453,7 @@ static void serviceRawNtpProbe()
     rawNtpProbe.state = RAW_NTP_DONE;
     rawNtpProbe.error = RAW_NTP_ERR_NONE;
     rawNtpUdp.stop();
+    restoreRawNtpProbeWifiSleep();
 
     logPrefix("NTPR");
     Serial.print(F("Reply server="));
@@ -1385,6 +1480,14 @@ static void serviceRawNtpProbe()
       Serial.print(F(" timing=not-usable"));
     }
 
+    Serial.print(F(" probe_mode="));
+    Serial.print(rawNtpProbe.noSleepRequested ? F("no-sleep") : F("normal"));
+    Serial.print(F(" wifi_sleep="));
+    Serial.print(wifiSleepModeText(rawNtpProbe.wifiSleepDuring));
+    if (rawNtpProbe.sleepOverrideApplied) {
+      Serial.print(F(" restored="));
+      Serial.print(wifiSleepModeText(rawNtpProbe.wifiSleepAfter));
+    }
     Serial.print(F(" refid="));
     Serial.println(rawNtpReferenceIdText());
     return;
@@ -2065,13 +2168,17 @@ static void handleHistoryClear()
 static void handleRawNtpProbePage()
 {
   String html = pageStart(F("HU-058D Raw NTP Probe"));
-  html.reserve(8200);
+  html.reserve(9400);
 
   html += F(
     "<div class='card'><h2>Raw four-timestamp NTP probe</h2>"
     "<p>This is a diagnostic-only NTP client. A button press sends exactly one UDP "
     "request to the selected configured server. It does not set the clock, restart "
     "SNTP, or change the normal hourly synchronisation schedule.</p>"
+    "<p>The <strong>No-sleep</strong> probe temporarily changes ESP8266 Wi-Fi power "
+    "management to <code>NONE</code>, waits 250 ms, performs one probe, then restores "
+    "the exact sleep mode that was active beforehand. This lets us compare radio/power-"
+    "save latency without permanently changing normal clock operation.</p>"
     "<p class='hint'>Offset uses the standard four timestamps T1/T2/T3/T4. Network RTT "
     "uses the ESP8266 monotonic timer for the local elapsed interval. Because packet "
     "receipt is noticed by the main event loop rather than hardware timestamping, the "
@@ -2088,7 +2195,14 @@ static void handleRawNtpProbePage()
     html += String(i);
     html += F("'>Probe ");
     html += String(i + 1);
-    html += F("</button></form> <code>");
+    html += F(" normal</button></form> "
+              "<form class='inline' method='post' action='/probe/start'>"
+              "<input type='hidden' name='mode' value='nosleep'>"
+              "<button class='secondary' type='submit' name='server' value='");
+    html += String(i);
+    html += F("'>Probe ");
+    html += String(i + 1);
+    html += F(" no-sleep</button></form> <code>");
     html += htmlEscape(String((host != nullptr && host[0] != '\0') ? host : "(empty)"));
     html += F("</code><br><br>");
   }
@@ -2100,6 +2214,12 @@ static void handleRawNtpProbePage()
     "<div class='k'>Error</div><div class='v' id='rp-error'>-</div>"
     "<div class='k'>Server</div><div class='v' id='rp-server'>-</div>"
     "<div class='k'>Peer IP</div><div class='v' id='rp-ip'>-</div>"
+    "<div class='k'>Probe mode</div><div class='v' id='rp-probe-mode'>-</div>"
+    "<div class='k'>Wi-Fi sleep before</div><div class='v' id='rp-sleep-before'>-</div>"
+    "<div class='k'>Wi-Fi sleep during</div><div class='v' id='rp-sleep-during'>-</div>"
+    "<div class='k'>Wi-Fi sleep after</div><div class='v' id='rp-sleep-after'>-</div>"
+    "<div class='k'>Current Wi-Fi sleep</div><div class='v' id='rp-sleep-current'>-</div>"
+    "<div class='k'>Sleep restore</div><div class='v' id='rp-sleep-restore'>-</div>"
     "<div class='k'>Offset</div><div class='v' id='rp-offset'>-</div>"
     "<div class='k'>Network RTT</div><div class='v' id='rp-rtt'>-</div>"
     "<div class='k'>Server processing</div><div class='v' id='rp-processing'>-</div>"
@@ -2125,6 +2245,10 @@ static void handleRawNtpProbePage()
     "function ms(v,signed){if(v===null||v===undefined)return '-';return (signed&&Number(v)>=0?'+':'')+Number(v).toFixed(3)+' ms';}"
     "async function loadProbe(){try{const r=await fetch('/api/ntp-probe',{cache:'no-store'});const p=await r.json();"
       "put('rp-state',p.state);put('rp-error',p.error);put('rp-server',p.server);put('rp-ip',p.ip);"
+      "put('rp-probe-mode',p.probe_mode);put('rp-sleep-before',p.wifi_sleep_before);"
+      "put('rp-sleep-during',p.wifi_sleep_during);put('rp-sleep-after',p.wifi_sleep_after);"
+      "put('rp-sleep-current',p.wifi_sleep_current);"
+      "put('rp-sleep-restore',p.sleep_override_applied?(p.sleep_restore_ok?'Restored':'FAILED'):'Not changed');"
       "put('rp-offset',p.timing_valid?ms(p.offset_ms,true):'-');"
       "put('rp-rtt',p.timing_valid?ms(p.rtt_ms,false):'-');"
       "put('rp-processing',p.timing_valid?ms(p.server_processing_ms,false):'-');"
@@ -2162,7 +2286,10 @@ static void handleRawNtpProbeStart()
     return;
   }
 
-  startRawNtpProbe(static_cast<uint8_t>(requested));
+  const bool noSleepRequested =
+      server.hasArg(F("mode")) && server.arg(F("mode")) == F("nosleep");
+
+  startRawNtpProbe(static_cast<uint8_t>(requested), noSleepRequested);
 
   server.sendHeader(F("Location"), F("/probe"), true);
   server.send(303, F("text/plain"), F("Probe requested"));
@@ -2171,7 +2298,7 @@ static void handleRawNtpProbeStart()
 static void handleApiRawNtpProbe()
 {
   String json;
-  json.reserve(1500);
+  json.reserve(1900);
 
   const bool hasReply = rawNtpProbe.state == RAW_NTP_DONE;
 
@@ -2194,6 +2321,20 @@ static void handleApiRawNtpProbe()
   json += hasReply ? F("true") : F("false");
   json += F(",\"timing_valid\":");
   json += rawNtpProbe.timingValid ? F("true") : F("false");
+  json += F(",\"probe_mode\":\"");
+  json += rawNtpProbe.noSleepRequested ? F("No sleep") : F("Normal");
+  json += F("\",\"wifi_sleep_before\":\"");
+  json += jsonEscape(wifiSleepModeText(rawNtpProbe.wifiSleepBefore));
+  json += F("\",\"wifi_sleep_during\":\"");
+  json += jsonEscape(wifiSleepModeText(rawNtpProbe.wifiSleepDuring));
+  json += F("\",\"wifi_sleep_after\":\"");
+  json += jsonEscape(wifiSleepModeText(rawNtpProbe.wifiSleepAfter));
+  json += F("\",\"wifi_sleep_current\":\"");
+  json += jsonEscape(wifiSleepModeText(WiFi.getSleepMode()));
+  json += F("\",\"sleep_override_applied\":");
+  json += rawNtpProbe.sleepOverrideApplied ? F("true") : F("false");
+  json += F(",\"sleep_restore_ok\":");
+  json += rawNtpProbe.sleepRestoreSucceeded ? F("true") : F("false");
 
   if (rawNtpProbe.timingValid) {
     json += F(",\"offset_ms\":");

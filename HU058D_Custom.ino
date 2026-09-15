@@ -13,6 +13,7 @@
     - NTP offset, network RTT, server processing time, stratum and packet metadata
     - manual probe page/API; probes never set or adjust the system clock
     - record the resolved SNTP peer IP with each history sample
+    - keep ESP8266 station Wi-Fi in no-sleep mode for lower and more stable NTP latency
 
   Configuration format remains compatible with v0.02/v0.03/v0.04.
 
@@ -958,6 +959,16 @@ static void scheduleRestart(uint32_t delayMs = 1500)
   restartAtMs = millis() + delayMs;
 }
 
+static String wifiSleepModeText(WiFiSleepType_t mode)
+{
+  switch (mode) {
+    case WIFI_NONE_SLEEP:  return F("NONE");
+    case WIFI_LIGHT_SLEEP: return F("LIGHT");
+    case WIFI_MODEM_SLEEP: return F("MODEM");
+    default:               return F("UNKNOWN");
+  }
+}
+
 // -----------------------------------------------------------------------------
 // HU-058D ESP -> STC protocol
 // -----------------------------------------------------------------------------
@@ -1491,6 +1502,21 @@ static void logHeartbeat()
 // Wi-Fi
 // -----------------------------------------------------------------------------
 
+static void enforceLowLatencyWifi()
+{
+  const WiFiSleepType_t before = WiFi.getSleepMode();
+  const bool setOk = WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  const WiFiSleepType_t after = WiFi.getSleepMode();
+
+  logPrefix("WIFI");
+  Serial.print(F("Sleep mode "));
+  Serial.print(wifiSleepModeText(before));
+  Serial.print(F(" -> "));
+  Serial.print(wifiSleepModeText(after));
+  Serial.print(F(" requested=NONE result="));
+  Serial.println(setOk && after == WIFI_NONE_SLEEP ? F("ok") : F("FAILED"));
+}
+
 static bool hasSavedWifi()
 {
   return config.wifiSsid[0] != '\0';
@@ -1505,6 +1531,7 @@ static void startStation()
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
+  enforceLowLatencyWifi();
 
   logPrefix("WIFI");
   Serial.print(F("Connecting to SSID="));
@@ -1874,6 +1901,10 @@ static void handleRoot()
     html += '-';
   }
   html += F("</div>");
+
+  html += F("<div class='k'>Wi-Fi sleep</div><div class='v'>");
+  html += htmlEscape(wifiSleepModeText(WiFi.getSleepMode()));
+  html += F(" <span class='ok'>(forced NONE for timing)</span></div>");
 
   html += F("<div class='k'>Setup AP</div><div class='v'>");
   if (setupApActive) {
@@ -2521,6 +2552,10 @@ static void handleSystemPage()
   html += String(ESP.getFreeHeap());
   html += F(" bytes</div>");
 
+  html += F("<div class='k'>Wi-Fi sleep mode</div><div class='v'>");
+  html += htmlEscape(wifiSleepModeText(WiFi.getSleepMode()));
+  html += F(" (firmware target: NONE)</div>");
+
   html += F("<div class='k'>Reset reason</div><div class='v'>");
   html += htmlEscape(ESP.getResetReason());
   html += F("</div>");
@@ -2678,6 +2713,9 @@ static void handleApiStatus()
   json += WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String();
   json += F("\",\"rssi\":");
   json += WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) : String(0);
+  json += F(",\"wifi_sleep\":\"");
+  json += jsonEscape(wifiSleepModeText(WiFi.getSleepMode()));
+  json += F("\"");
 
   json += F(",\"local_time\":\"");
   json += jsonEscape(currentLocalTime());
@@ -3054,6 +3092,7 @@ void loop()
       WiFi.mode(WIFI_STA);
     }
 
+    enforceLowLatencyWifi();
     WiFi.begin(config.wifiSsid, config.wifiPassword);
   }
 
@@ -3070,6 +3109,10 @@ void loop()
     wasConnected = connectedNow;
     wifiStateInitialised = true;
   } else if (connectedNow && !wasConnected) {
+    // Re-assert after every association as well as before WiFi.begin().
+    // This covers SDK auto-reconnects and AP/STA mode transitions.
+    enforceLowLatencyWifi();
+
     logPrefix("WIFI");
     Serial.print(F("Connected IP="));
     Serial.print(WiFi.localIP());
@@ -3107,6 +3150,7 @@ void loop()
       WiFi.mode(WIFI_AP_STA);
     }
 
+    enforceLowLatencyWifi();
     WiFi.begin(config.wifiSsid, config.wifiPassword);
   }
 

@@ -1,146 +1,440 @@
 # HU-058D Custom Firmware
 
-Custom ESP8266 firmware for the HU-058D NTP clock PCB.
+Replacement firmware for the ESP-01S / ESP8266 used in the HU-058D Wi-Fi NTP clock.
 
-This project replaces the original ESP-01S firmware while retaining the
-factory STC microcontroller firmware responsible for the clock display and
-other front-panel functions.
+The project began as a reverse-engineering exercise to replace the original Chinese firmware with an English, locally configurable firmware that handles New Zealand daylight saving correctly. It has since grown into a small timekeeping and network-diagnostics platform with browser OTA updates, NTP quality history, raw NTP probes, and MQTT telemetry.
 
-## Current status
+> **Current development version:** `v0.07-dev`
+>
+> `v0.07-dev` is undergoing soak testing before promotion to a release. The last tagged release is `v0.04`.
 
-Version v0.02 is running successfully on real hardware.
+## Hardware target
 
-Working features:
+- HU-058D clock PCB
+- ESP-01S / ESP8266EX
+- 1 MiB SPI flash
+- 26 MHz crystal
+- ESP -> display-controller link on GPIO2 / `Serial1`
+- UART protocol: 9600 baud, 8N1
 
-- English web interface
-- Wi-Fi configuration and network scanning
-- fallback setup access point
-- NTP time synchronisation
-- automatic NZST / NZDT daylight-saving handling
-- configurable timezone
-- configurable NTP servers
-- persistent configuration
-- web interface remains available while connected to normal Wi-Fi
-- manual NTP synchronisation
-- reboot, Wi-Fi reset and factory-reset controls
-- status and diagnostic information
+The display controller expects a 9-byte time frame once per second:
 
-## Hardware
+| Byte | Meaning |
+| --- | --- |
+| 0 | year - 1900 |
+| 1 | month, 0-11 |
+| 2 | day |
+| 3 | hour, 0-23 |
+| 4 | minute |
+| 5 | second |
+| 6 | weekday, Sunday = 0 |
+| 7 | command |
+| 8 | checksum: sum of bytes 0-7 modulo 256 |
 
-PCB:
+Normal time frames use command `0x00`. Command `0x02` is used during startup while usable time is not yet available.
 
-    HU-058D V1.0 240516
+## Main features
 
-Wi-Fi module:
+### Clock and time
 
-    ESP-01S
-    ESP8266EX
-    1 MiB SPI flash
+- NTP/SNTP time synchronisation
+- configurable POSIX timezone rule
+- correct NZST/NZDT handling by default
+- configurable primary and fallback NTP servers
+- manual NTP resynchronisation
+- local time, UTC time and Unix epoch diagnostics
+- `SYNCED`, `HOLDOVER`, and `UNSYNCED` time states
+- time continues locally between NTP updates
 
-The original clock/display controller is retained.
+Default New Zealand timezone rule:
 
-## ESP to clock protocol
+```text
+NZST-12NZDT,M9.5.0/2,M4.1.0/3
+```
 
-The ESP8266 communicates with the factory STC controller using:
+Default NTP servers:
 
-    ESP8266 GPIO2 / UART1 TX
-    9600 baud
-    8N1
-    one 9-byte packet per second
+```text
+nz.pool.ntp.org
+pool.ntp.org
+time.cloudflare.com
+```
 
-Time packet:
+### Web interface
 
-    Byte 0  Year since 1900
-    Byte 1  Month, 0-11
-    Byte 2  Day, 1-31
-    Byte 3  Hour, 0-23
-    Byte 4  Minute, 0-59
-    Byte 5  Second, 0-59
-    Byte 6  Weekday, Sunday = 0
-    Byte 7  Command, 0 = normal time
-    Byte 8  8-bit additive checksum of bytes 0-7
+The clock provides an English web UI for:
 
-A startup/waiting packet used by the factory firmware was also identified:
+- status and diagnostics
+- Wi-Fi configuration and scanning
+- time zone and NTP configuration
+- NTP history and graphs
+- raw NTP diagnostics
+- MQTT configuration and status
+- system information
+- browser-based OTA firmware updates
+- manual Wi-Fi reconnect
+- reboot, Wi-Fi reset, and factory reset
 
-    00 00 00 00 00 00 00 02 02
+When connected to the normal LAN the clock also advertises:
 
-## Default timezone
+```text
+http://hu058d-clock.local/
+```
 
-The firmware defaults to New Zealand time using:
+mDNS availability depends on the local network. The clock can always be accessed directly by its IP address.
 
-    NZST-12NZDT,M9.5.0/2,M4.1.0/3
+If saved Wi-Fi cannot be used, the firmware starts the setup access point:
 
-This automatically switches between NZST (UTC+12) and NZDT (UTC+13).
+```text
+SSID:     HU058D-Setup
+Password: hu058dclock
+IP:       192.168.4.1
+```
 
-## First-time setup
+## NTP quality diagnostics
 
-When no valid Wi-Fi configuration exists, the clock starts:
+The firmware records information about successful SNTP updates rather than merely treating NTP as a black box that occasionally changes the clock.
 
-    SSID: HU058D-Setup
-    Password: hu058dclock
+Diagnostics include:
 
-Connect to the access point and browse to:
+- successful sync count
+- observed failed-poll count
+- age of the most recent successful sync
+- server hostname and resolved peer IP
+- lwIP SNTP reachability register
+- correction applied at each successful update
+- elapsed interval since the previous successful update
+- estimated oscillator drift in ppm
+- weighted long-term drift estimate
+- 48-sample in-RAM history
 
-    http://192.168.4.1/
+### Correction and oscillator drift
 
-After Wi-Fi is configured, the setup AP shuts down and the web interface
-remains accessible at the clock's DHCP address.
+The ESP8266 SNTP interface does not expose the full four timestamps from its internal NTP transaction. Oscillator drift is therefore estimated by comparing the wall-clock time established at one successful update with monotonic elapsed time until the next update.
+
+Sign convention:
+
+- positive drift = the ESP clock was running fast
+- negative drift = the ESP clock was running slow
+- positive correction = SNTP moved the clock forward
+- negative correction = SNTP moved the clock backward
+
+Network delay and path asymmetry can contaminate individual drift samples. The value is therefore a useful diagnostic estimate, not a laboratory-grade oscillator measurement.
+
+### Short resync filtering
+
+Normal successful SNTP updates are approximately one hour apart, but retry or recovery events can occur sooner after network disruption or manual resynchronisation.
+
+Short intervals are useful evidence that a correction occurred, but they are poor oscillator measurements because network timing error can dominate the tiny amount of clock drift accumulated over only a few minutes.
+
+`v0.07-dev` therefore keeps every correction in history but only treats intervals of at least **3000 seconds / 50 minutes** as valid drift samples.
+
+For a short resync:
+
+```json
+{
+  "correction_ms": -0.158,
+  "ntp_interval_s": 60,
+  "drift_valid": false,
+  "drift_ppm": null
+}
+```
+
+The weighted drift value is calculated only from qualified samples:
+
+```text
+drift_avg_ppm = -sum(correction) / sum(interval)
+```
+
+with the required unit conversion from milliseconds to ppm.
+
+## NTP history
+
+Up to 48 successful correction events are retained in RAM. At the normal hourly cadence this is roughly two days, although retry/recovery syncs can shorten the covered period.
+
+Each history entry contains:
+
+- Unix epoch
+- correction in milliseconds
+- sync interval
+- drift in ppm when the interval qualifies
+- `drift_valid`
+- NTP server index/name
+- resolved peer IP
+
+The history is intentionally RAM-only and is cleared by a reboot.
+
+Raw JSON is available at:
+
+```text
+/api/ntp-history
+```
+
+Example:
+
+```bash
+curl -s http://<clock-ip>/api/ntp-history | jq
+```
+
+## Raw NTP probe
+
+The **NTP Probe** page performs a manual diagnostic four-timestamp NTP exchange without changing the system clock.
+
+It reports information including:
+
+- NTP offset
+- network RTT
+- server processing time
+- stratum
+- leap indicator
+- protocol version and mode
+- poll interval and precision
+- root delay and dispersion
+- reference ID and reference timestamp
+- receive/transmit timestamps
+- resolved peer IP
+
+The probe uses its own UDP transaction and does **not** affect the SNTP clock discipline or NTP history.
+
+This feature was also used to identify the large receive-side latency introduced by ESP8266 modem sleep.
+
+## Wi-Fi sleep behaviour
+
+Station-mode Wi-Fi is deliberately kept in:
+
+```text
+WIFI_NONE_SLEEP
+```
+
+The clock is USB powered, so reduced power consumption is less valuable than predictable network timing. Disabling modem sleep significantly reduced NTP receive latency and improved consistency during testing.
+
+The configured sleep state is reasserted after association and reconnect events.
+
+## MQTT telemetry
+
+`v0.07-dev` includes a lightweight MQTT 3.1.1 client implemented directly over `WiFiClient`. No external MQTT Arduino library is required.
+
+Configuration is available from the **MQTT** page:
+
+- enable/disable MQTT
+- broker hostname or IP
+- port, default `1883`
+- optional username/password
+- base topic, default `hu058d/clock`
+- publish interval, 10-86400 seconds, default 60
+
+### Topics
+
+```text
+<base>/availability
+<base>/telemetry
+```
+
+`availability` is retained:
+
+```text
+online
+```
+
+The MQTT Last Will is retained as:
+
+```text
+offline
+```
+
+Telemetry is published QoS 0 as JSON.
+
+Current telemetry fields include:
+
+| Field | Description |
+| --- | --- |
+| `epoch` | current Unix epoch |
+| `local_time` | formatted local time |
+| `uptime_s` | ESP uptime |
+| `rssi_dbm` | Wi-Fi RSSI |
+| `free_heap` | current free heap |
+| `ntp_state` | `SYNCED`, `HOLDOVER`, or `UNSYNCED` |
+| `ntp_age_s` | age of most recent successful sync |
+| `ntp_sync_count` | successful SNTP updates since boot |
+| `ntp_failure_count` | observed failed polls |
+| `history_count` | NTP history entries currently in RAM |
+| `correction_ms` | most recent correction |
+| `ntp_interval_s` | interval between the last two successful updates |
+| `drift_valid` | whether the latest interval qualifies for oscillator drift |
+| `drift_ppm` | latest qualified drift estimate, otherwise `null` |
+| `drift_avg_ppm` | weighted drift across qualified in-RAM history |
+| `drift_avg_samples` | number of samples used in the weighted estimate |
+| `ntp_server` | most recent NTP hostname and peer IP |
+| `wifi_connected_s` | age of the current Wi-Fi association |
+| `wifi_sleep` | current ESP8266 Wi-Fi sleep mode |
+
+Example:
+
+```json
+{
+  "epoch": 1789855616,
+  "local_time": "2026-09-20 10:06:56 NZST",
+  "uptime_s": 75,
+  "rssi_dbm": -63,
+  "free_heap": 38696,
+  "ntp_state": "SYNCED",
+  "ntp_age_s": 4,
+  "ntp_sync_count": 2,
+  "ntp_failure_count": 0,
+  "history_count": 1,
+  "correction_ms": -0.158,
+  "ntp_interval_s": 60,
+  "drift_valid": false,
+  "drift_ppm": null,
+  "drift_avg_ppm": null,
+  "drift_avg_samples": 0,
+  "ntp_server": "nz.pool.ntp.org (202.124.96.215)",
+  "wifi_connected_s": 65,
+  "wifi_sleep": "NONE"
+}
+```
+
+Watch all clock topics with Mosquitto:
+
+```bash
+mosquitto_sub -h <broker-ip> -v -t 'hu058d/clock/#'
+```
+
+Add `-u` and `-P` when broker authentication is enabled.
+
+## JSON APIs
+
+The browser interface uses local JSON endpoints that are also useful for scripts and external monitoring:
+
+```text
+/api/status
+/api/ntp-history
+/api/ntp-probe
+```
+
+Examples:
+
+```bash
+curl -s http://<clock-ip>/api/status | jq
+curl -s http://<clock-ip>/api/ntp-history | jq
+curl -s http://<clock-ip>/api/ntp-probe | jq
+```
+
+## Serial diagnostics
+
+UART0 / GPIO1 provides event-oriented diagnostics at:
+
+```text
+115200 baud
+```
+
+A heartbeat is logged every 60 seconds, alongside event logs for Wi-Fi, NTP, MQTT, OTA, and system actions.
+
+Example:
+
+```text
+[21:50:42] NTP   Sync #8 time=2026-09-19 21:50:42 NZST correction=-110.403 ms interval=01:00:00 drift=+30.667 ppm fast server=nz.pool.ntp.org (...)
+[21:51:42] STAT  time=... wifi=Connected ... ntp=SYNCED ... mqtt=connected heap=39224B
+```
+
+Short resyncs are explicitly identified as filtered drift measurements.
+
+## Persistent configuration
+
+Configuration is stored using ESP8266 EEPROM emulation.
+
+`v0.07` configuration format is version 3 and expands the emulated EEPROM area from 512 to 1024 bytes for MQTT settings.
+
+Existing version 2 Wi-Fi/time settings are migrated automatically. MQTT defaults to disabled until configured.
 
 ## Building
 
-Arduino IDE with the ESP8266 Community board package.
+No third-party Arduino libraries are required beyond the ESP8266 Arduino core.
 
-Recommended settings:
+Tested with ESP8266 Community core `3.1.2`.
 
-    Board:            Generic ESP8266 Module
-    Flash Size:       1MB
-    CPU Frequency:    80 MHz
-    Flash Mode:       QIO
-    Flash Frequency:  80 MHz
-    Upload Speed:     115200
+Recommended Arduino settings:
 
-## Programming
+```text
+Board:            Generic ESP8266 Module
+Flash Size:       1MB (FS:none OTA:~502KB)
+CPU Frequency:    80 MHz
+Flash Mode:       QIO
+Flash Frequency:  80 MHz
+Upload Speed:     115200
+```
 
-CP2102 wiring:
+### Current v0.07-dev memory use
 
-    CP2102 BLACK  -> ESP GND
-    CP2102 GREY   -> ESP TX / GPIO1
-    CP2102 WHITE  -> ESP RX / GPIO3
-    CP2102 RED    -> NOT CONNECTED
+After MQTT telemetry and drift filtering:
 
-Power the clock normally from its own USB input.
+```text
+Global/static RAM:  33024 / 80192 bytes  (41%)
+IRAM total:         61099 / 65536 bytes  (93%)
+  actual IRAM code: 28331 bytes
+  instruction cache:32768 bytes
+Flash/IROM code:   380092 / 1048576 bytes (36%)
+```
 
-To enter the ESP8266 serial bootloader:
+IRAM is the tightest resource and should be checked after every significant feature addition.
 
-1. Connect GPIO0 to GND.
-2. Reset or power-cycle the clock.
-3. Upload the firmware.
-4. Disconnect GPIO0 from GND.
-5. Power-cycle normally.
+## OTA firmware updates
 
-## Versions
+Once the custom firmware is installed and connected to Wi-Fi, subsequent builds can normally be installed from the **Firmware** page in the web UI.
 
-### v0.02
+In Arduino IDE use:
 
-First fully usable release.
+```text
+Sketch -> Export Compiled Binary
+```
 
-- English configuration UI
-- persistent Wi-Fi configuration
-- NTP synchronisation
-- automatic NZST/NZDT
-- configurable NTP servers and timezone
-- fallback setup AP
-- system/status pages
+and upload the generated `.ino.bin` file.
 
-### v0.01
+The `1MB (FS:none OTA:~502KB)` flash layout leaves room to stage an OTA image before rebooting into it.
 
-Proof-of-concept replacement firmware.
+Do not remove power while the bootloader is copying a successfully uploaded OTA image into place.
 
-- hard-coded Wi-Fi credentials
-- NTP synchronisation
-- automatic NZST/NZDT
-- proved the reverse-engineered ESP-to-STC protocol
+## Serial flashing and recovery
 
-## License
+The ESP-01S ROM bootloader remains available even if an application build is broken.
 
-No license has been selected yet.
+To enter download mode, hold GPIO0 low while resetting/powering the ESP, then release GPIO0 after reset.
+
+Typical serial restore/flash command:
+
+```bash
+esptool --port /dev/ttyUSBx --baud 115200 write-flash 0x000000 firmware.bin
+```
+
+Do not connect a USB-UART adapter's 5 V output directly to ESP8266 power or logic pins. The ESP8266 is a 3.3 V device.
+
+Keeping a verified dump of the original factory flash before installing replacement firmware is strongly recommended.
+
+## Version history
+
+| Version | Main additions |
+| --- | --- |
+| `v0.02` | working replacement clock protocol, English web UI, Wi-Fi setup, NTP, automatic NZ DST, persistent configuration |
+| `v0.03` | browser OTA, mDNS, Wi-Fi reconnect, expanded system/time diagnostics |
+| `v0.04` | NTP quality diagnostics, correction/drift estimate, reachability, sync/failure counters, serial heartbeat |
+| `v0.05-dev` | 48-entry RAM history, drift/correction graphs, `/api/ntp-history` |
+| `v0.06-dev` | raw four-timestamp NTP probe, peer-IP history, no-sleep Wi-Fi timing improvement |
+| `v0.07-dev` | MQTT telemetry/availability, configuration migration, short-resync drift filtering, weighted drift, Wi-Fi reconnect timing context |
+
+## Current development notes
+
+`v0.07-dev` is currently being soak-tested with MQTT telemetry recorded externally. In particular, free heap and drift are useful long-term indicators for memory stability and timekeeping behaviour.
+
+The in-RAM history remains useful for local diagnostics, while MQTT allows external systems such as Gladys Assistant, InfluxDB, or another collector to retain longer-term telemetry across ESP reboots.
+
+## Project goal
+
+This project is intentionally more than a minimal clock replacement. The aim is to keep the HU-058D hardware useful while using it as a compact platform for learning about:
+
+- ESP8266 firmware development
+- reverse-engineering simple embedded protocols
+- NTP/SNTP behaviour
+- oscillator drift and network timing error
+- MQTT telemetry
+- constrained-memory embedded diagnostics
+

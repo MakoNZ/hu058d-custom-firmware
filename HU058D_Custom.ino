@@ -1,5 +1,5 @@
 /*
-  HU-058D Custom Firmware v0.06-dev
+  HU-058D Custom Firmware v0.07-dev
   ===============================
 
   Target:
@@ -7,15 +7,16 @@
     1 MiB flash
     HU-058D clock PCB
 
-  v0.06-dev:
+  v0.07-dev:
     - everything proven in v0.05
     - diagnostic-only raw four-timestamp NTP probe
     - NTP offset, network RTT, server processing time, stratum and packet metadata
     - manual probe page/API; probes never set or adjust the system clock
     - record the resolved SNTP peer IP with each history sample
     - keep ESP8266 station Wi-Fi in no-sleep mode for lower and more stable NTP latency
+    - MQTT telemetry with configurable broker, credentials, topic and publish interval
 
-  Configuration format remains compatible with v0.02/v0.03/v0.04.
+  Configuration v2 is migrated automatically to v3 when MQTT settings are saved.
 
   No external Arduino libraries are required beyond the ESP8266 Arduino core.
 */
@@ -39,7 +40,7 @@
 // -----------------------------------------------------------------------------
 
 static const char *FW_NAME    = "HU-058D Custom Firmware";
-static const char *FW_VERSION = "v0.06-dev";
+static const char *FW_VERSION = "v0.07-dev";
 static const char *FW_BUILD   = __DATE__ " " __TIME__;
 static const char *MDNS_HOST  = "hu058d-clock";
 
@@ -102,8 +103,8 @@ static const uint32_t NTP_HOLDOVER_AFTER_SECONDS = 4500UL;
 // -----------------------------------------------------------------------------
 
 static const uint32_t CONFIG_MAGIC   = 0x48553032UL; // "HU02"
-static const uint16_t CONFIG_VERSION = 2;
-static const size_t EEPROM_SIZE      = 512;
+static const uint16_t CONFIG_VERSION = 3;
+static const size_t EEPROM_SIZE      = 1024;
 
 struct DeviceConfig {
   uint32_t magic;
@@ -118,6 +119,28 @@ struct DeviceConfig {
   char ntp2[64];
   char ntp3[64];
 
+  uint8_t mqttEnabled;
+  char mqttHost[64];
+  uint16_t mqttPort;
+  char mqttUsername[33];
+  char mqttPassword[65];
+  char mqttTopic[65];
+  uint32_t mqttIntervalSeconds;
+
+  uint32_t checksum;
+};
+
+// Exact v2 layout, retained only so existing clocks can migrate without losing
+// Wi-Fi/time settings when the larger v3 MQTT configuration is introduced.
+struct LegacyDeviceConfigV2 {
+  uint32_t magic;
+  uint16_t version;
+  char wifiSsid[33];
+  char wifiPassword[65];
+  char timezone[80];
+  char ntp1[64];
+  char ntp2[64];
+  char ntp3[64];
   uint32_t checksum;
 };
 
@@ -130,6 +153,7 @@ static DeviceConfig config;
 static ESP8266WebServer server(80);
 static ESP8266HTTPUpdateServer httpUpdater(true);
 static DNSServer dnsServer;
+static WiFiClient mqttClient;
 
 static bool setupApActive = false;
 static bool mdnsActive = false;
@@ -228,6 +252,14 @@ static uint32_t lastNtpReachSampleMs = 0;
 
 static uint8_t lastOtaLoggedPercent = 0;
 
+static bool mqttConnected = false;
+static uint32_t mqttConnectCount = 0;
+static uint32_t mqttPublishCount = 0;
+static uint32_t mqttLastConnectAttemptMs = 0;
+static uint32_t mqttLastPublishMs = 0;
+static uint32_t mqttLastIoMs = 0;
+static String mqttLastError;
+
 // -----------------------------------------------------------------------------
 // Small helpers
 // -----------------------------------------------------------------------------
@@ -252,20 +284,23 @@ static void copyText(char *dst, size_t dstSize, const char *src)
   copyText(dst, dstSize, String(src ? src : ""));
 }
 
+static uint32_t fnv1a(const uint8_t *p, size_t length)
+{
+  uint32_t hash = 2166136261UL;
+  for (size_t i = 0; i < length; ++i) { hash ^= p[i]; hash *= 16777619UL; }
+  return hash;
+}
+
 static uint32_t configCrc(const DeviceConfig &cfg)
 {
-  // Lightweight FNV-1a checksum over the structure, excluding checksum itself.
-  const uint8_t *p = reinterpret_cast<const uint8_t *>(&cfg);
-  const size_t length = sizeof(DeviceConfig) - sizeof(cfg.checksum);
+  return fnv1a(reinterpret_cast<const uint8_t *>(&cfg),
+               sizeof(DeviceConfig) - sizeof(cfg.checksum));
+}
 
-  uint32_t hash = 2166136261UL;
-
-  for (size_t i = 0; i < length; ++i) {
-    hash ^= p[i];
-    hash *= 16777619UL;
-  }
-
-  return hash;
+static uint32_t legacyConfigCrc(const LegacyDeviceConfigV2 &cfg)
+{
+  return fnv1a(reinterpret_cast<const uint8_t *>(&cfg),
+               sizeof(LegacyDeviceConfigV2) - sizeof(cfg.checksum));
 }
 
 static void setConfigDefaults()
@@ -280,29 +315,55 @@ static void setConfigDefaults()
   copyText(config.ntp2, sizeof(config.ntp2), DEFAULT_NTP2);
   copyText(config.ntp3, sizeof(config.ntp3), DEFAULT_NTP3);
 
+  config.mqttEnabled = 0;
+  config.mqttPort = 1883;
+  copyText(config.mqttTopic, sizeof(config.mqttTopic), "hu058d/clock");
+  config.mqttIntervalSeconds = 60;
+
   config.checksum = configCrc(config);
 }
 
 static bool loadConfig()
 {
   EEPROM.begin(EEPROM_SIZE);
-  EEPROM.get(0, config);
 
-  if (config.magic != CONFIG_MAGIC ||
-      config.version != CONFIG_VERSION ||
-      config.checksum != configCrc(config)) {
+  uint32_t storedMagic = 0;
+  uint16_t storedVersion = 0;
+  EEPROM.get(0, storedMagic);
+  EEPROM.get(sizeof(storedMagic), storedVersion);
+
+  if (storedMagic == CONFIG_MAGIC && storedVersion == CONFIG_VERSION) {
+    EEPROM.get(0, config);
+    if (config.checksum != configCrc(config)) { setConfigDefaults(); return false; }
+  } else if (storedMagic == CONFIG_MAGIC && storedVersion == 2) {
+    LegacyDeviceConfigV2 oldConfig = {};
+    EEPROM.get(0, oldConfig);
+    if (oldConfig.checksum != legacyConfigCrc(oldConfig)) { setConfigDefaults(); return false; }
+
+    setConfigDefaults();
+    copyText(config.wifiSsid, sizeof(config.wifiSsid), oldConfig.wifiSsid);
+    copyText(config.wifiPassword, sizeof(config.wifiPassword), oldConfig.wifiPassword);
+    copyText(config.timezone, sizeof(config.timezone), oldConfig.timezone);
+    copyText(config.ntp1, sizeof(config.ntp1), oldConfig.ntp1);
+    copyText(config.ntp2, sizeof(config.ntp2), oldConfig.ntp2);
+    copyText(config.ntp3, sizeof(config.ntp3), oldConfig.ntp3);
+    config.checksum = configCrc(config);
+    // Migration remains in RAM until the next explicit settings save.
+  } else {
     setConfigDefaults();
     return false;
   }
 
-  // Defensive terminators in case EEPROM contains malformed data.
-  config.wifiSsid[sizeof(config.wifiSsid) - 1] = '\0';
-  config.wifiPassword[sizeof(config.wifiPassword) - 1] = '\0';
-  config.timezone[sizeof(config.timezone) - 1] = '\0';
-  config.ntp1[sizeof(config.ntp1) - 1] = '\0';
-  config.ntp2[sizeof(config.ntp2) - 1] = '\0';
-  config.ntp3[sizeof(config.ntp3) - 1] = '\0';
-
+  config.wifiSsid[sizeof(config.wifiSsid)-1] = '\0';
+  config.wifiPassword[sizeof(config.wifiPassword)-1] = '\0';
+  config.timezone[sizeof(config.timezone)-1] = '\0';
+  config.ntp1[sizeof(config.ntp1)-1] = '\0';
+  config.ntp2[sizeof(config.ntp2)-1] = '\0';
+  config.ntp3[sizeof(config.ntp3)-1] = '\0';
+  config.mqttHost[sizeof(config.mqttHost)-1] = '\0';
+  config.mqttUsername[sizeof(config.mqttUsername)-1] = '\0';
+  config.mqttPassword[sizeof(config.mqttPassword)-1] = '\0';
+  config.mqttTopic[sizeof(config.mqttTopic)-1] = '\0';
   return true;
 }
 
@@ -1493,6 +1554,9 @@ static void logHeartbeat()
     Serial.print(formatNtpDrift());
   }
 
+  Serial.print(F(" mqtt="));
+  Serial.print(config.mqttEnabled ? (mqttConnected ? F("connected") : F("disconnected")) : F("disabled"));
+
   Serial.print(F(" heap="));
   Serial.print(ESP.getFreeHeap());
   Serial.println(F("B"));
@@ -1671,6 +1735,170 @@ static void startMdns()
 }
 
 // -----------------------------------------------------------------------------
+// MQTT telemetry (MQTT 3.1.1, QoS 0)
+// -----------------------------------------------------------------------------
+
+static void mqttDisconnect(const String &reason)
+{
+  if (mqttClient.connected()) mqttClient.stop();
+  mqttConnected = false;
+  mqttLastError = reason;
+}
+
+static size_t mqttEncodeRemainingLength(uint32_t value, uint8_t *out)
+{
+  size_t n = 0;
+  do {
+    uint8_t digit = value % 128U;
+    value /= 128U;
+    if (value > 0) digit |= 0x80;
+    out[n++] = digit;
+  } while (value > 0 && n < 4);
+  return n;
+}
+
+static bool mqttWriteString(uint8_t *buf, size_t cap, size_t &pos, const String &value)
+{
+  const size_t len = value.length();
+  if (len > 65535 || pos + 2 + len > cap) return false;
+  buf[pos++] = static_cast<uint8_t>(len >> 8);
+  buf[pos++] = static_cast<uint8_t>(len);
+  memcpy(buf + pos, value.c_str(), len);
+  pos += len;
+  return true;
+}
+
+static bool mqttPublish(const String &topic, const String &payload, bool retain = false)
+{
+  if (!mqttClient.connected()) return false;
+  uint8_t header[5];
+  header[0] = retain ? 0x31 : 0x30;
+  const uint32_t remaining = 2U + topic.length() + payload.length();
+  const size_t rl = mqttEncodeRemainingLength(remaining, header + 1);
+  if (mqttClient.write(header, 1 + rl) != 1 + rl) return false;
+  uint8_t tlen[2] = { static_cast<uint8_t>(topic.length() >> 8), static_cast<uint8_t>(topic.length()) };
+  if (mqttClient.write(tlen, 2) != 2) return false;
+  if (mqttClient.write(reinterpret_cast<const uint8_t *>(topic.c_str()), topic.length()) != topic.length()) return false;
+  if (mqttClient.write(reinterpret_cast<const uint8_t *>(payload.c_str()), payload.length()) != payload.length()) return false;
+  mqttLastIoMs = millis();
+  return true;
+}
+
+static String mqttBaseTopic()
+{
+  String topic(config.mqttTopic);
+  while (topic.endsWith("/")) topic.remove(topic.length() - 1);
+  return topic;
+}
+
+static bool mqttConnectBroker()
+{
+  if (!config.mqttEnabled || config.mqttHost[0] == '\0' || WiFi.status() != WL_CONNECTED) return false;
+  mqttClient.stop();
+  if (!mqttClient.connect(config.mqttHost, config.mqttPort)) {
+    mqttLastError = F("TCP connection failed");
+    return false;
+  }
+
+  uint8_t packet[512];
+  size_t pos = 5; // reserve fixed header + max remaining-length bytes
+  if (!mqttWriteString(packet, sizeof(packet), pos, F("MQTT"))) return false;
+  packet[pos++] = 4;
+  uint8_t flags = 0x02; // clean session
+  if (config.mqttUsername[0]) flags |= 0x80;
+  if (config.mqttPassword[0]) flags |= 0x40;
+  flags |= 0x24; // will flag + retained will, QoS 0
+  packet[pos++] = flags;
+  packet[pos++] = 0; packet[pos++] = 60; // keepalive
+
+  String clientId = F("hu058d-"); clientId += String(ESP.getChipId(), HEX);
+  if (!mqttWriteString(packet, sizeof(packet), pos, clientId) ||
+      !mqttWriteString(packet, sizeof(packet), pos, mqttBaseTopic() + F("/availability")) ||
+      !mqttWriteString(packet, sizeof(packet), pos, F("offline"))) { mqttClient.stop(); return false; }
+  if (config.mqttUsername[0] && !mqttWriteString(packet, sizeof(packet), pos, String(config.mqttUsername))) { mqttClient.stop(); return false; }
+  if (config.mqttPassword[0] && !mqttWriteString(packet, sizeof(packet), pos, String(config.mqttPassword))) { mqttClient.stop(); return false; }
+
+  const size_t bodyStart = 5;
+  const uint32_t remaining = pos - bodyStart;
+  uint8_t fixed[5]; fixed[0] = 0x10;
+  const size_t rl = mqttEncodeRemainingLength(remaining, fixed + 1);
+  if (mqttClient.write(fixed, 1 + rl) != 1 + rl || mqttClient.write(packet + bodyStart, remaining) != remaining) {
+    mqttClient.stop(); mqttLastError = F("CONNECT write failed"); return false;
+  }
+
+  const uint32_t deadline = millis() + 1200UL;
+  while (mqttClient.connected() && mqttClient.available() < 4 && static_cast<int32_t>(millis() - deadline) < 0) delay(1);
+  if (mqttClient.available() < 4) { mqttClient.stop(); mqttLastError = F("CONNACK timeout"); return false; }
+  uint8_t reply[4]; mqttClient.read(reply, 4);
+  if (reply[0] != 0x20 || reply[1] != 0x02 || reply[3] != 0x00) {
+    mqttClient.stop(); mqttLastError = String(F("CONNACK error ")) + String(reply[3]); return false;
+  }
+
+  mqttConnected = true;
+  mqttConnectCount++;
+  mqttLastError = F("None");
+  mqttLastIoMs = millis();
+  mqttPublish(mqttBaseTopic() + F("/availability"), F("online"), true);
+  logPrefix("MQTT"); Serial.print(F("Connected broker=")); Serial.print(config.mqttHost);
+  Serial.print(':'); Serial.print(config.mqttPort); Serial.print(F(" topic=")); Serial.println(mqttBaseTopic());
+  return true;
+}
+
+static String mqttTelemetryJson()
+{
+  const time_t now = time(nullptr);
+  const uint32_t age = ntpSyncAgeSeconds();
+  String j; j.reserve(520);
+  j += F("{\"epoch\":"); j += now >= MIN_VALID_EPOCH ? String(static_cast<uint32_t>(now)) : String(0);
+  j += F(",\"local_time\":\""); j += jsonEscape(currentLocalTime()); j += '"';
+  j += F(",\"uptime_s\":"); j += String(millis()/1000UL);
+  j += F(",\"rssi_dbm\":"); j += WiFi.status()==WL_CONNECTED ? String(WiFi.RSSI()) : String(0);
+  j += F(",\"free_heap\":"); j += String(ESP.getFreeHeap());
+  j += F(",\"ntp_state\":\""); j += jsonEscape(ntpStateText()); j += '"';
+  j += F(",\"ntp_age_s\":"); j += age==UINT32_MAX ? String(F("null")) : String(age);
+  j += F(",\"ntp_sync_count\":"); j += String(ntpSyncCount);
+  j += F(",\"ntp_failure_count\":"); j += String(ntpObservedFailureCount);
+  j += F(",\"history_count\":"); j += String(ntpHistoryCount);
+  j += F(",\"correction_ms\":"); j += ntpQualityValid ? String((double)lastNtpCorrectionUs/1000.0,3) : String(F("null"));
+  j += F(",\"drift_ppm\":"); j += ntpQualityValid ? String(lastNtpDriftPpm,3) : String(F("null"));
+  j += F(",\"ntp_server\":\""); j += jsonEscape(lastNtpServerDisplay()); j += '"';
+  j += F(",\"wifi_sleep\":\""); j += jsonEscape(wifiSleepModeText(WiFi.getSleepMode())); j += F("\"}");
+  return j;
+}
+
+static bool mqttPublishTelemetry()
+{
+  if (!mqttConnected || !mqttClient.connected()) return false;
+  const bool ok = mqttPublish(mqttBaseTopic() + F("/telemetry"), mqttTelemetryJson(), false);
+  if (ok) { mqttPublishCount++; mqttLastPublishMs = millis(); }
+  else mqttDisconnect(F("Publish failed"));
+  return ok;
+}
+
+static void serviceMqtt()
+{
+  if (!config.mqttEnabled) { if (mqttClient.connected()) mqttClient.stop(); mqttConnected=false; return; }
+  if (WiFi.status() != WL_CONNECTED) { mqttDisconnect(F("Wi-Fi disconnected")); return; }
+  while (mqttClient.available()) mqttClient.read();
+  if (!mqttClient.connected()) {
+    mqttConnected = false;
+    if (millis() - mqttLastConnectAttemptMs >= 15000UL) {
+      mqttLastConnectAttemptMs = millis();
+      if (mqttConnectBroker()) mqttPublishTelemetry();
+    }
+    return;
+  }
+  mqttConnected = true;
+  const uint32_t intervalSeconds = config.mqttIntervalSeconds < 10UL ? 10UL : config.mqttIntervalSeconds;
+  const uint32_t intervalMs = intervalSeconds * 1000UL;
+  if (millis() - mqttLastPublishMs >= intervalMs) mqttPublishTelemetry();
+  if (millis() - mqttLastIoMs >= 30000UL) {
+    const uint8_t ping[2] = {0xC0,0x00};
+    if (mqttClient.write(ping,2)==2) mqttLastIoMs=millis(); else mqttDisconnect(F("PING failed"));
+  }
+}
+
+// -----------------------------------------------------------------------------
 // HTML
 // -----------------------------------------------------------------------------
 
@@ -1735,6 +1963,7 @@ static String pageStart(const String &title)
             "<a class='btn' href='/time'>Time</a>"
             "<a class='btn' href='/history'>History</a>"
             "<a class='btn' href='/probe'>NTP Probe</a>"
+            "<a class='btn' href='/mqtt'>MQTT</a>"
             "<a class='btn' href='/system'>System</a>"
             "</nav>");
 
@@ -2506,6 +2735,48 @@ static void handleSyncNow()
   sendHtml(html + pageEnd());
 }
 
+static void handleMqttPage()
+{
+  String html = pageStart(F("HU-058D MQTT"));
+  html += F("<div class='card'><h2>MQTT telemetry</h2><div class='grid'>"
+            "<div class='k'>State</div><div class='v'>");
+  html += config.mqttEnabled ? (mqttConnected ? F("Connected") : F("Disconnected")) : F("Disabled");
+  html += F("</div><div class='k'>Connections</div><div class='v'>"); html += String(mqttConnectCount);
+  html += F("</div><div class='k'>Telemetry publishes</div><div class='v'>"); html += String(mqttPublishCount);
+  html += F("</div><div class='k'>Last error</div><div class='v'>"); html += htmlEscape(mqttLastError.length()?mqttLastError:String(F("None")));
+  html += F("</div></div></div><div class='card'><h2>Configuration</h2>"
+            "<form method='post' action='/mqtt/save'>"
+            "<label><input style='width:auto' type='checkbox' name='enabled' value='1'");
+  if (config.mqttEnabled) html += F(" checked");
+  html += F("> Enable MQTT</label><label for='host'>Broker hostname or IP</label><input id='host' name='host' maxlength='63' value='");
+  html += htmlEscape(String(config.mqttHost));
+  html += F("'><label for='port'>Port</label><input id='port' name='port' type='number' min='1' max='65535' value='"); html += String(config.mqttPort);
+  html += F("'><label for='username'>Username</label><input id='username' name='username' maxlength='32' value='"); html += htmlEscape(String(config.mqttUsername));
+  html += F("'><label for='password'>Password</label><input id='password' name='password' maxlength='64' type='password' autocomplete='new-password'>"
+            "<p class='hint'>Leave password blank to keep the existing password.</p>"
+            "<label for='topic'>Base topic</label><input id='topic' name='topic' maxlength='64' value='"); html += htmlEscape(String(config.mqttTopic));
+  html += F("'><p class='hint'>Telemetry: <code>&lt;base&gt;/telemetry</code>; retained availability: <code>&lt;base&gt;/availability</code>.</p>"
+            "<label for='interval'>Publish interval (seconds)</label><input id='interval' name='interval' type='number' min='10' max='86400' value='"); html += String(config.mqttIntervalSeconds);
+  html += F("'><div class='actions'><button type='submit'>Save MQTT settings</button></div></form></div>");
+  sendHtml(html + pageEnd());
+}
+
+static void handleMqttSave()
+{
+  String host=server.arg(F("host")); String user=server.arg(F("username")); String pass=server.arg(F("password")); String topic=server.arg(F("topic"));
+  host.trim(); user.trim(); topic.trim();
+  const long port=server.arg(F("port")).toInt(); const long interval=server.arg(F("interval")).toInt(); const bool enabled=server.hasArg(F("enabled"));
+  if ((enabled && host.length()==0) || host.length()>63 || user.length()>32 || pass.length()>64 || topic.length()==0 || topic.length()>64 || port<1 || port>65535 || interval<10 || interval>86400) {
+    sendHtml(pageStart(F("MQTT Error"))+F("<div class='card'><h2>Invalid MQTT settings</h2><a class='btn' href='/mqtt'>Back</a></div>")+pageEnd(),400); return;
+  }
+  config.mqttEnabled=enabled?1:0; copyText(config.mqttHost,sizeof(config.mqttHost),host); config.mqttPort=(uint16_t)port; copyText(config.mqttUsername,sizeof(config.mqttUsername),user);
+  if (pass.length()>0) copyText(config.mqttPassword,sizeof(config.mqttPassword),pass);
+  copyText(config.mqttTopic,sizeof(config.mqttTopic),topic); config.mqttIntervalSeconds=(uint32_t)interval;
+  if (!saveConfig()) { sendHtml(pageStart(F("Save Error"))+F("<div class='card'><h2>Save failed</h2></div>")+pageEnd(),500); return; }
+  mqttDisconnect(F("Configuration changed")); mqttLastConnectAttemptMs = millis()-15000UL;
+  sendHtml(pageStart(F("MQTT Saved"))+F("<div class='card'><h2>MQTT settings saved</h2><p>The clock will apply them immediately.</p><a class='btn' href='/mqtt'>MQTT status</a></div>")+pageEnd());
+}
+
 static void handleSystemPage()
 {
   String html = pageStart(F("HU-058D System"));
@@ -2800,6 +3071,13 @@ static void handleApiStatus()
   json += F(",\"ntp_history_capacity\":");
   json += String(NTP_HISTORY_CAPACITY);
 
+  json += F(",\"mqtt_enabled\":");
+  json += config.mqttEnabled ? F("true") : F("false");
+  json += F(",\"mqtt_connected\":");
+  json += mqttConnected ? F("true") : F("false");
+  json += F(",\"mqtt_publish_count\":");
+  json += String(mqttPublishCount);
+
   json += F(",\"setup_ap\":");
   json += setupApActive ? F("true") : F("false");
   json += F(",\"mdns\":");
@@ -2948,6 +3226,9 @@ static void configureWebServer()
   server.on("/probe", HTTP_GET, handleRawNtpProbePage);
   server.on("/probe/start", HTTP_POST, handleRawNtpProbeStart);
 
+  server.on("/mqtt", HTTP_GET, handleMqttPage);
+  server.on("/mqtt/save", HTTP_POST, handleMqttSave);
+
   server.on("/system", HTTP_GET, handleSystemPage);
   server.on("/firmware", HTTP_GET, handleFirmwarePage);
   server.on("/system/reboot", HTTP_POST, handleReboot);
@@ -3055,6 +3336,7 @@ void loop()
 {
   server.handleClient();
   serviceRawNtpProbe();
+  serviceMqtt();
 
   if (setupApActive) {
     dnsServer.processNextRequest();

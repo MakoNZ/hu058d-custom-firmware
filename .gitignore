@@ -12,3 +12,14 @@ build/
 .idea/
 .DS_Store
 *~
+
+# Generated telemetry exports
+
+.env.hu058d
+analysis-data/
+*-report/
+dist/
+
+# Python cache
+__pycache__/
+*.pyc

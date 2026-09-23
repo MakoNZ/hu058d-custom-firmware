@@ -347,6 +347,86 @@ Configuration is stored using ESP8266 EEPROM emulation.
 
 Existing version 2 Wi-Fi/time settings are migrated automatically. MQTT defaults to disabled until configured.
 
+## Data export and offline analysis
+
+Long-term telemetry can be exported from Gladys together with the clock's current
+in-RAM NTP history for offline analysis.
+
+The exporter reads local configuration from `.env.hu058d` when present. Start
+from the tracked example rather than putting credentials in the script:
+
+```bash
+cp .env.hu058d.example .env.hu058d
+chmod 600 .env.hu058d
+nano .env.hu058d
+```
+
+The real `.env.hu058d` file contains Gladys credentials and must not be committed.
+
+Example export:
+
+```bash
+./tools/export-hu058d-data.sh --days 7
+```
+
+Analyze a timestamped export archive with:
+
+```bash
+./tools/analyze-hu058d-data.py analysis-data/20260923-174511.tar.gz
+```
+
+The analyser produces a Markdown and JSON summary plus diagnostic graphs and CSV
+files for free heap, RSSI, NTP drift, peer behaviour, and robust drift outliers.
+It also performs a small automated stability evidence check covering soak time,
+NTP failures, Wi-Fi association age, telemetry cadence, and heap trend. The check
+is deliberately a diagnostic aid rather than an automatic release decision.
+
+On Arch Linux the analyser dependencies can be installed with:
+
+```bash
+sudo pacman -S python-pandas python-matplotlib
+```
+
+Recommended `.gitignore` entries:
+
+```text
+.env.hu058d
+analysis-data/
+*-report/
+dist/
+```
+
+## Release artifacts
+
+Tagged releases should include the compiled OTA `.bin` and its SHA-256 checksum
+as GitHub Release assets. Keeping binaries as release assets avoids filling the
+normal Git history with generated files while still making a known firmware
+image easy to recover later.
+
+After exporting a binary from the tagged source, package it with:
+
+```bash
+./tools/package-release.sh v0.07 /path/to/HU058D_Custom.ino.bin
+```
+
+This creates:
+
+```text
+dist/v0.07/
+├── HU058D_Custom-v0.07.bin
+├── HU058D_Custom-v0.07.bin.sha256
+└── manifest.txt
+```
+
+Verify the downloaded binary before flashing:
+
+```bash
+sha256sum -c HU058D_Custom-v0.07.bin.sha256
+```
+
+The release manifest records the Git tag/commit, binary size, checksum, and
+Arduino target settings used by this project.
+
 ## Building
 
 No third-party Arduino libraries are required beyond the ESP8266 Arduino core.

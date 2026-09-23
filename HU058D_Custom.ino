@@ -1,5 +1,5 @@
 /*
-  HU-058D Custom Firmware v0.07-dev
+  HU-058D Custom Firmware v0.07
   ===============================
 
   Target:
@@ -7,7 +7,7 @@
     1 MiB flash
     HU-058D clock PCB
 
-  v0.07-dev:
+  v0.07:
     - everything proven in v0.05
     - diagnostic-only raw four-timestamp NTP probe
     - NTP offset, network RTT, server processing time, stratum and packet metadata
@@ -15,6 +15,8 @@
     - record the resolved SNTP peer IP with each history sample
     - keep ESP8266 station Wi-Fi in no-sleep mode for lower and more stable NTP latency
     - MQTT telemetry with configurable broker, credentials, topic and publish interval
+    - retain short SNTP resync corrections while filtering them from oscillator-drift estimates
+    - weighted drift telemetry plus Wi-Fi reconnect timing context
 
   Configuration v2 is migrated automatically to v3 when MQTT settings are saved.
 
@@ -40,7 +42,7 @@
 // -----------------------------------------------------------------------------
 
 static const char *FW_NAME    = "HU-058D Custom Firmware";
-static const char *FW_VERSION = "v0.07-dev";
+static const char *FW_VERSION = "v0.07";
 static const char *FW_BUILD   = __DATE__ " " __TIME__;
 static const char *MDNS_HOST  = "hu058d-clock";
 
@@ -88,15 +90,23 @@ static const uint32_t NTP_UNIX_EPOCH_OFFSET = 2208988800UL;
 // ESP8266 lwIP is configured for three SNTP servers.
 static const uint8_t NTP_SERVER_COUNT = 3;
 
-// Keep two days of hourly time-quality history in RAM. The buffer is deliberately
-// not persisted in v0.05 so we can study the data structure and memory behaviour
-// before introducing flash wear and persistent-history migration problems.
+// Keep up to 48 time-quality corrections in RAM, nominally about two days at the
+// normal hourly SNTP cadence. Extra retry/recovery syncs are retained too, so the
+// covered time span can be shorter. The buffer is deliberately not persisted.
 static const uint8_t NTP_HISTORY_CAPACITY = 48;
 
 // The default SNTP refresh interval is one hour. After 75 minutes without a
 // successful update we call the clock "HOLDOVER" rather than pretending the
 // network time source is still current.
 static const uint32_t NTP_HOLDOVER_AFTER_SECONDS = 4500UL;
+
+// A correction measured across a short retry/recovery interval is useful as an
+// event record, but network timing error dominates too much to call it crystal
+// drift. Keep the correction in history, but only expose drift for intervals of
+// at least 50 minutes.
+static const uint32_t NTP_DRIFT_MIN_INTERVAL_SECONDS = 3000UL;
+static const uint64_t NTP_DRIFT_MIN_INTERVAL_US =
+    static_cast<uint64_t>(NTP_DRIFT_MIN_INTERVAL_SECONDS) * 1000000ULL;
 
 // -----------------------------------------------------------------------------
 // Persistent configuration
@@ -175,7 +185,10 @@ static int64_t lastNtpSyncWallUs = 0;
 static uint64_t lastNtpIntervalUs = 0;
 static int64_t lastNtpCorrectionUs = 0;
 static double lastNtpDriftPpm = 0.0;
+// ntpQualityValid means the most recent sync produced a correction/interval
+// measurement. Drift has a stricter interval requirement of its own.
 static bool ntpQualityValid = false;
+static bool lastNtpDriftValid = false;
 
 struct NtpHistorySample {
   uint32_t epoch;
@@ -246,6 +259,7 @@ static uint32_t lastRawNtpProbeStartMs = 0;
 static uint32_t restartAtMs = 0;
 static uint32_t wifiReconnectAtMs = 0;
 static uint32_t lastReconnectAttemptMs = 0;
+static uint32_t lastWifiConnectedMs = 0;
 static uint32_t lastWaitingPacketMs = 0;
 static uint32_t lastHeartbeatMs = 0;
 static uint32_t lastNtpReachSampleMs = 0;
@@ -825,6 +839,10 @@ static String formatNtpDrift()
     return F("Waiting for second sync");
   }
 
+  if (!lastNtpDriftValid) {
+    return F("Filtered (short resync interval)");
+  }
+
   String out;
 
   if (lastNtpDriftPpm >= 0.0) {
@@ -846,6 +864,15 @@ static String formatNtpInterval()
 
   return formatDurationSeconds(
       static_cast<uint32_t>(lastNtpIntervalUs / 1000000ULL));
+}
+
+static uint32_t wifiConnectedAgeSeconds()
+{
+  if (WiFi.status() != WL_CONNECTED || lastWifiConnectedMs == 0) {
+    return UINT32_MAX;
+  }
+
+  return static_cast<uint32_t>(millis() - lastWifiConnectedMs) / 1000UL;
 }
 
 static uint8_t countBits8(uint8_t value)
@@ -965,6 +992,42 @@ static uint8_t ntpHistoryPhysicalIndex(uint8_t chronologicalIndex)
 static const NtpHistorySample &ntpHistoryAt(uint8_t chronologicalIndex)
 {
   return ntpHistory[ntpHistoryPhysicalIndex(chronologicalIndex)];
+}
+
+static bool ntpHistorySampleDriftValid(const NtpHistorySample &sample)
+{
+  return sample.intervalSeconds >= NTP_DRIFT_MIN_INTERVAL_SECONDS;
+}
+
+static bool weightedNtpDriftPpm(double &ppmOut, uint8_t &validSamplesOut)
+{
+  double correctionMs = 0.0;
+  uint64_t intervalSeconds = 0;
+  uint8_t validSamples = 0;
+
+  for (uint8_t i = 0; i < ntpHistoryCount; ++i) {
+    const NtpHistorySample &sample = ntpHistoryAt(i);
+
+    if (!ntpHistorySampleDriftValid(sample)) {
+      continue;
+    }
+
+    correctionMs += static_cast<double>(sample.correctionMs);
+    intervalSeconds += sample.intervalSeconds;
+    ++validSamples;
+  }
+
+  validSamplesOut = validSamples;
+
+  if (validSamples == 0 || intervalSeconds == 0) {
+    ppmOut = 0.0;
+    return false;
+  }
+
+  // correction_ms * 1000 converts milliseconds to microseconds. Dividing by
+  // seconds then yields microseconds/second, numerically identical to ppm.
+  ppmOut = -correctionMs * 1000.0 / static_cast<double>(intervalSeconds);
+  return true;
 }
 
 static void addNtpHistorySample()
@@ -1184,26 +1247,25 @@ static void onTimeSet(bool fromSntp)
       static_cast<int64_t>(tv.tv_usec);
 
   bool qualityUpdatedThisSync = false;
+  lastNtpDriftValid = false;
 
   if (lastNtpSyncMonoUs != 0 && lastNtpSyncWallUs != 0) {
     const uint64_t elapsedMonoUs = monoNowUs - lastNtpSyncMonoUs;
 
-    // A tiny interval is not useful for oscillator estimation and can happen
-    // after a manual reconfiguration. Wait at least 60 seconds.
-    if (elapsedMonoUs >= 60000000ULL) {
+    if (elapsedMonoUs > 0) {
       const int64_t predictedWallUs =
           lastNtpSyncWallUs + static_cast<int64_t>(elapsedMonoUs);
 
       lastNtpCorrectionUs = wallNowUs - predictedWallUs;
       lastNtpIntervalUs = elapsedMonoUs;
 
-      // Positive correction means the free-running clock had fallen behind.
-      // Report oscillator drift with the intuitive sign:
-      //   positive ppm = oscillator running fast
-      //   negative ppm = oscillator running slow
+      // Keep the mathematical per-interval ppm value internally for the RAM
+      // history record, but only call it oscillator drift when the interval is
+      // long enough that ordinary NTP/network timing noise is not dominant.
       lastNtpDriftPpm =
           -static_cast<double>(lastNtpCorrectionUs) * 1000000.0 /
           static_cast<double>(elapsedMonoUs);
+      lastNtpDriftValid = elapsedMonoUs >= NTP_DRIFT_MIN_INTERVAL_US;
 
       ntpQualityValid = true;
       qualityUpdatedThisSync = true;
@@ -1236,6 +1298,15 @@ static void onTimeSet(bool fromSntp)
     Serial.print(formatNtpDrift());
   } else {
     Serial.print(F(" quality=waiting-for-second-sync"));
+  }
+
+  Serial.print(F(" wifi_connected_for="));
+  const uint32_t wifiAge = wifiConnectedAgeSeconds();
+  if (wifiAge == UINT32_MAX) {
+    Serial.print('-');
+  } else {
+    Serial.print(wifiAge);
+    Serial.print('s');
   }
 
   Serial.print(F(" server="));
@@ -1554,6 +1625,27 @@ static void logHeartbeat()
     Serial.print(formatNtpDrift());
   }
 
+  double weightedDrift = 0.0;
+  uint8_t weightedSamples = 0;
+  if (weightedNtpDriftPpm(weightedDrift, weightedSamples)) {
+    Serial.print(F(" drift_avg="));
+    if (weightedDrift >= 0.0) {
+      Serial.print('+');
+    }
+    Serial.print(weightedDrift, 3);
+    Serial.print(F("ppm/"));
+    Serial.print(weightedSamples);
+  }
+
+  Serial.print(F(" wifi_for="));
+  const uint32_t wifiAge = wifiConnectedAgeSeconds();
+  if (wifiAge == UINT32_MAX) {
+    Serial.print('-');
+  } else {
+    Serial.print(wifiAge);
+    Serial.print('s');
+  }
+
   Serial.print(F(" mqtt="));
   Serial.print(config.mqttEnabled ? (mqttConnected ? F("connected") : F("disconnected")) : F("disabled"));
 
@@ -1688,6 +1780,7 @@ static bool connectStationWithTimeout(uint32_t timeoutMs)
     Serial.print(F(" RSSI="));
     Serial.print(WiFi.RSSI());
     Serial.println(F(" dBm"));
+    lastWifiConnectedMs = millis();
     return true;
   }
 
@@ -1848,7 +1941,12 @@ static String mqttTelemetryJson()
 {
   const time_t now = time(nullptr);
   const uint32_t age = ntpSyncAgeSeconds();
-  String j; j.reserve(520);
+  const uint32_t wifiAge = wifiConnectedAgeSeconds();
+  double weightedDrift = 0.0;
+  uint8_t weightedSamples = 0;
+  const bool weightedValid = weightedNtpDriftPpm(weightedDrift, weightedSamples);
+
+  String j; j.reserve(700);
   j += F("{\"epoch\":"); j += now >= MIN_VALID_EPOCH ? String(static_cast<uint32_t>(now)) : String(0);
   j += F(",\"local_time\":\""); j += jsonEscape(currentLocalTime()); j += '"';
   j += F(",\"uptime_s\":"); j += String(millis()/1000UL);
@@ -1860,8 +1958,13 @@ static String mqttTelemetryJson()
   j += F(",\"ntp_failure_count\":"); j += String(ntpObservedFailureCount);
   j += F(",\"history_count\":"); j += String(ntpHistoryCount);
   j += F(",\"correction_ms\":"); j += ntpQualityValid ? String((double)lastNtpCorrectionUs/1000.0,3) : String(F("null"));
-  j += F(",\"drift_ppm\":"); j += ntpQualityValid ? String(lastNtpDriftPpm,3) : String(F("null"));
+  j += F(",\"ntp_interval_s\":"); j += ntpQualityValid ? String((uint32_t)(lastNtpIntervalUs/1000000ULL)) : String(F("null"));
+  j += F(",\"drift_valid\":"); j += (ntpQualityValid && lastNtpDriftValid) ? F("true") : F("false");
+  j += F(",\"drift_ppm\":"); j += (ntpQualityValid && lastNtpDriftValid) ? String(lastNtpDriftPpm,3) : String(F("null"));
+  j += F(",\"drift_avg_ppm\":"); j += weightedValid ? String(weightedDrift,3) : String(F("null"));
+  j += F(",\"drift_avg_samples\":"); j += String(weightedSamples);
   j += F(",\"ntp_server\":\""); j += jsonEscape(lastNtpServerDisplay()); j += '"';
+  j += F(",\"wifi_connected_s\":"); j += wifiAge==UINT32_MAX ? String(F("null")) : String(wifiAge);
   j += F(",\"wifi_sleep\":\""); j += jsonEscape(wifiSleepModeText(WiFi.getSleepMode())); j += F("\"}");
   return j;
 }
@@ -2222,8 +2325,9 @@ static void handleHistoryPage()
 
   html += F(
     "<div class='card'><h2>Time-quality history</h2>"
-    "<p>Each point is one successful SNTP correction separated from the previous "
-    "sample by at least 60 seconds. History is stored only in RAM and starts fresh after reboot.</p>"
+    "<p>Each point is one successful SNTP correction after the initial sync. Corrections from "
+    "intervals shorter than 50 minutes are retained as resync events but excluded from drift "
+    "statistics. History is stored only in RAM and starts fresh after reboot.</p>"
     "<div class='summary'>"
       "<div class='metric'><div class='k'>Samples</div><div class='mv' id='hist-count'>-</div></div>"
       "<div class='metric'><div class='k'>Mean drift</div><div class='mv' id='hist-mean'>-</div></div>"
@@ -2235,7 +2339,7 @@ static void handleHistoryPage()
 
     "<div class='card'><h2>Estimated oscillator drift</h2>"
     "<div class='chart-wrap'><canvas class='chart' id='drift-chart'></canvas></div>"
-    "<p class='hint'>Positive values mean the ESP8266 free-running clock was fast; negative values mean slow. Weighted drift uses the net correction over the total measured interval, so it is less misleading when sample intervals differ.</p>"
+    "<p class='hint'>Positive values mean the ESP8266 free-running clock was fast; negative values mean slow. Only intervals of at least 50 minutes are plotted as drift. Weighted drift uses only those qualified samples.</p>"
     "</div>"
 
     "<div class='card'><h2>NTP clock correction</h2>"
@@ -2267,7 +2371,8 @@ static void handleHistoryPage()
       "const accent=css.getPropertyValue('--accent').trim()||'#42a5f5';"
       "x.clearRect(0,0,w,h);x.font='12px system-ui';x.fillStyle=text;x.strokeStyle=border;x.lineWidth=1;"
       "if(!data.length){x.fillText('Waiting for NTP history samples...',12,24);return;}"
-      "let vals=data.map(s=>Number(s[key])).filter(Number.isFinite);"
+      "const num=v=>(v===null||v===undefined)?NaN:Number(v);"
+      "let vals=data.map(s=>num(s[key])).filter(Number.isFinite);"
       "if(!vals.length){x.fillText('No valid samples yet',12,24);return;}"
       "let lo=Math.min(...vals,0),hi=Math.max(...vals,0);"
       "if(lo===hi){lo-=1;hi+=1;}const pad=(hi-lo)*0.12||1;lo-=pad;hi+=pad;"
@@ -2278,9 +2383,9 @@ static void handleHistoryPage()
         "x.fillStyle=text;x.fillText(val.toFixed(Math.abs(val)<10?2:1),L-7,y);"
       "}"
       "const zeroY=T+(hi/(hi-lo))*ph;if(zeroY>=T&&zeroY<=T+ph){x.strokeStyle=text;x.beginPath();x.moveTo(L,zeroY);x.lineTo(w-R,zeroY);x.stroke();}"
-      "x.strokeStyle=accent;x.lineWidth=2;x.beginPath();"
-      "data.forEach((s,i)=>{const px=L+(data.length===1?pw/2:pw*i/(data.length-1));const val=Number(s[key]);const py=T+(hi-val)/(hi-lo)*ph;if(i===0)x.moveTo(px,py);else x.lineTo(px,py);});x.stroke();"
-      "x.fillStyle=accent;data.forEach((s,i)=>{const px=L+(data.length===1?pw/2:pw*i/(data.length-1));const val=Number(s[key]);const py=T+(hi-val)/(hi-lo)*ph;x.beginPath();x.arc(px,py,2.5,0,Math.PI*2);x.fill();});"
+      "x.strokeStyle=accent;x.lineWidth=2;x.beginPath();let drawing=false;"
+      "data.forEach((s,i)=>{const val=num(s[key]);if(!Number.isFinite(val)){drawing=false;return;}const px=L+(data.length===1?pw/2:pw*i/(data.length-1));const py=T+(hi-val)/(hi-lo)*ph;if(!drawing)x.moveTo(px,py);else x.lineTo(px,py);drawing=true;});x.stroke();"
+      "x.fillStyle=accent;data.forEach((s,i)=>{const val=num(s[key]);if(!Number.isFinite(val))return;const px=L+(data.length===1?pw/2:pw*i/(data.length-1));const py=T+(hi-val)/(hi-lo)*ph;x.beginPath();x.arc(px,py,2.5,0,Math.PI*2);x.fill();});"
       "x.fillStyle=text;x.textAlign='left';x.textBaseline='top';"
       "const first=new Date(data[0].epoch*1000),last=new Date(data[data.length-1].epoch*1000);"
       "x.fillText(first.toLocaleString(),L,h-B+9);"
@@ -2289,20 +2394,21 @@ static void handleHistoryPage()
     "}"
     "async function loadHistory(){"
       "try{const r=await fetch('/api/ntp-history',{cache:'no-store'});const j=await r.json();const d=j.samples||[];"
-        "document.getElementById('hist-count').textContent=d.length+' / '+j.capacity;"
-        "if(d.length){"
-          "const dr=d.map(s=>Number(s.drift_ppm));const mean=dr.reduce((a,b)=>a+b,0)/dr.length;"
+        "const vd=d.filter(s=>s.drift_valid&&s.drift_ppm!==null);"
+        "document.getElementById('hist-count').textContent=d.length+' / '+j.capacity+' ('+vd.length+' drift-valid)';"
+        "if(vd.length){"
+          "const dr=vd.map(s=>Number(s.drift_ppm));const mean=dr.reduce((a,b)=>a+b,0)/dr.length;"
           "document.getElementById('hist-mean').textContent=fmtSigned(mean,3,'ppm');"
-          "const totalS=d.reduce((a,s)=>a+Number(s.interval_s||0),0),totalC=d.reduce((a,s)=>a+Number(s.correction_ms||0),0);"
+          "const totalS=vd.reduce((a,s)=>a+Number(s.interval_s||0),0),totalC=vd.reduce((a,s)=>a+Number(s.correction_ms||0),0);"
           "document.getElementById('hist-weighted').textContent=totalS?fmtSigned(-totalC*1000/totalS,3,'ppm'):'-';"
           "document.getElementById('hist-range').textContent=Math.min(...dr).toFixed(3)+' to '+Math.max(...dr).toFixed(3)+' ppm';"
-          "document.getElementById('hist-latest').textContent=fmtSigned(d[d.length-1].correction_ms,3,'ms');"
-        "}else{document.getElementById('hist-mean').textContent='-';document.getElementById('hist-weighted').textContent='-';document.getElementById('hist-range').textContent='-';document.getElementById('hist-latest').textContent='-';}"
+        "}else{document.getElementById('hist-mean').textContent='-';document.getElementById('hist-weighted').textContent='-';document.getElementById('hist-range').textContent='-';}"
+        "document.getElementById('hist-latest').textContent=d.length?fmtSigned(d[d.length-1].correction_ms,3,'ms'):'-';"
         "drawChart('drift-chart',d,'drift_ppm','ppm');drawChart('correction-chart',d,'correction_ms','ms');"
         "const rows=document.getElementById('history-rows');rows.innerHTML='';"
         "if(!d.length){rows.innerHTML=\"<tr><td colspan='6'>Waiting for the second suitable NTP sync.</td></tr>\";return;}"
         "d.slice().reverse().slice(0,12).forEach(s=>{const tr=document.createElement('tr');"
-          "const vals=[new Date(s.epoch*1000).toLocaleString(),fmtSigned(s.correction_ms,3,'ms'),fmtSigned(s.drift_ppm,3,'ppm'),fmtDur(s.interval_s),s.server||'Unknown',s.server_ip||'-'];"
+          "const vals=[new Date(s.epoch*1000).toLocaleString(),fmtSigned(s.correction_ms,3,'ms'),s.drift_valid?fmtSigned(s.drift_ppm,3,'ppm'):'Filtered',fmtDur(s.interval_s),s.server||'Unknown',s.server_ip||'-'];"
           "vals.forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.appendChild(td);});rows.appendChild(tr);"
         "});"
       "}catch(e){console.log('history refresh failed',e);}"
@@ -2987,6 +3093,13 @@ static void handleApiStatus()
   json += F(",\"wifi_sleep\":\"");
   json += jsonEscape(wifiSleepModeText(WiFi.getSleepMode()));
   json += F("\"");
+  json += F(",\"wifi_connected_s\":");
+  const uint32_t wifiAge = wifiConnectedAgeSeconds();
+  if (wifiAge == UINT32_MAX) {
+    json += F("null");
+  } else {
+    json += String(wifiAge);
+  }
 
   json += F(",\"local_time\":\"");
   json += jsonEscape(currentLocalTime());
@@ -3028,12 +3141,27 @@ static void handleApiStatus()
     json += F("null");
   }
 
+  json += F(",\"ntp_drift_valid\":");
+  json += (ntpQualityValid && lastNtpDriftValid) ? F("true") : F("false");
+
   json += F(",\"ntp_drift_ppm\":");
-  if (ntpQualityValid) {
+  if (ntpQualityValid && lastNtpDriftValid) {
     json += String(lastNtpDriftPpm, 3);
   } else {
     json += F("null");
   }
+
+  double weightedDrift = 0.0;
+  uint8_t weightedSamples = 0;
+  const bool weightedValid = weightedNtpDriftPpm(weightedDrift, weightedSamples);
+  json += F(",\"ntp_drift_avg_ppm\":");
+  if (weightedValid) {
+    json += String(weightedDrift, 3);
+  } else {
+    json += F("null");
+  }
+  json += F(",\"ntp_drift_avg_samples\":");
+  json += String(weightedSamples);
 
   json += F(",\"ntp_interval_s\":");
   if (ntpQualityValid) {
@@ -3118,8 +3246,15 @@ static void handleApiNtpHistory()
     json += String(sample.epoch);
     json += F(",\"correction_ms\":");
     json += String(sample.correctionMs, 3);
+    const bool driftValid = ntpHistorySampleDriftValid(sample);
     json += F(",\"drift_ppm\":");
-    json += String(sample.driftPpm, 3);
+    if (driftValid) {
+      json += String(sample.driftPpm, 3);
+    } else {
+      json += F("null");
+    }
+    json += F(",\"drift_valid\":");
+    json += driftValid ? F("true") : F("false");
     json += F(",\"interval_s\":");
     json += String(sample.intervalSeconds);
     json += F(",\"server_index\":");
@@ -3391,6 +3526,8 @@ void loop()
     wasConnected = connectedNow;
     wifiStateInitialised = true;
   } else if (connectedNow && !wasConnected) {
+    lastWifiConnectedMs = millis();
+
     // Re-assert after every association as well as before WiFi.begin().
     // This covers SDK auto-reconnects and AP/STA mode transitions.
     enforceLowLatencyWifi();

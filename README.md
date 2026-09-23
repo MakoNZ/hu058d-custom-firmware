@@ -4,9 +4,9 @@ Replacement firmware for the ESP-01S / ESP8266 used in the HU-058D Wi-Fi NTP clo
 
 The project began as a reverse-engineering exercise to replace the original Chinese firmware with an English, locally configurable firmware that handles New Zealand daylight saving correctly. It has since grown into a small timekeeping and network-diagnostics platform with browser OTA updates, NTP quality history, raw NTP probes, and MQTT telemetry.
 
-> **Current development version:** `v0.07-dev`
+> **Current release:** `v0.07`
 >
-> `v0.07-dev` is undergoing soak testing before promotion to a release. The last tagged release is `v0.04`.
+> `v0.07` was promoted after an approximately 80-hour soak test of the MQTT, NTP, Wi-Fi, history, and memory-stability changes introduced during the `v0.05-dev` through `v0.07-dev` development cycle.
 
 ## Hardware target
 
@@ -127,7 +127,7 @@ Normal successful SNTP updates are approximately one hour apart, but retry or re
 
 Short intervals are useful evidence that a correction occurred, but they are poor oscillator measurements because network timing error can dominate the tiny amount of clock drift accumulated over only a few minutes.
 
-`v0.07-dev` therefore keeps every correction in history but only treats intervals of at least **3000 seconds / 50 minutes** as valid drift samples.
+`v0.07` therefore keeps every correction in history but only treats intervals of at least **3000 seconds / 50 minutes** as valid drift samples.
 
 For a short resync:
 
@@ -212,7 +212,7 @@ The configured sleep state is reasserted after association and reconnect events.
 
 ## MQTT telemetry
 
-`v0.07-dev` includes a lightweight MQTT 3.1.1 client implemented directly over `WiFiClient`. No external MQTT Arduino library is required.
+`v0.07` includes a lightweight MQTT 3.1.1 client implemented directly over `WiFiClient`. No external MQTT Arduino library is required.
 
 Configuration is available from the **MQTT** page:
 
@@ -364,7 +364,7 @@ Flash Frequency:  80 MHz
 Upload Speed:     115200
 ```
 
-### Current v0.07-dev memory use
+### Current v0.07 memory use
 
 After MQTT telemetry and drift filtering:
 
@@ -419,13 +419,39 @@ Keeping a verified dump of the original factory flash before installing replacem
 | `v0.04` | NTP quality diagnostics, correction/drift estimate, reachability, sync/failure counters, serial heartbeat |
 | `v0.05-dev` | 48-entry RAM history, drift/correction graphs, `/api/ntp-history` |
 | `v0.06-dev` | raw four-timestamp NTP probe, peer-IP history, no-sleep Wi-Fi timing improvement |
-| `v0.07-dev` | MQTT telemetry/availability, configuration migration, short-resync drift filtering, weighted drift, Wi-Fi reconnect timing context |
+| `v0.07` | MQTT telemetry/availability, configuration migration, short-resync drift filtering, weighted drift, Wi-Fi reconnect timing context; promoted after extended soak testing |
 
-## Current development notes
+## v0.07 release validation
 
-`v0.07-dev` is currently being soak-tested with MQTT telemetry recorded externally. In particular, free heap and drift are useful long-term indicators for memory stability and timekeeping behaviour.
+The `v0.07` release candidate was soak-tested for approximately **79.6 continuous hours** before promotion.
+
+During that run:
+
+- ESP uptime reached approximately 3 days 7 hours 39 minutes with no reset
+- Wi-Fi remained associated for effectively the entire run, with no observed reconnect event after startup
+- MQTT produced 4,779 telemetry publishes at the configured one-minute cadence
+- 81 successful SNTP updates were observed with **0 failed polls**
+- the 48-entry NTP history ring filled and rolled over normally
+- short resynchronisation filtering continued to exclude sub-3000-second intervals from oscillator-drift calculations
+- free heap showed no downward trend or evidence of a memory leak
+- long-term weighted oscillator drift remained close to **-4.9 ppm**
+
+Individual hourly drift samples can still contain large positive or negative excursions because network delay and path asymmetry affect the apparent NTP correction. The weighted estimate is intentionally used to make the underlying oscillator behaviour easier to distinguish from those network effects.
 
 The in-RAM history remains useful for local diagnostics, while MQTT allows external systems such as Gladys Assistant, InfluxDB, or another collector to retain longer-term telemetry across ESP reboots.
+
+### External telemetry note
+
+Consumers should use `drift_valid` when interpreting `drift_ppm`. When the latest successful NTP update occurred too soon to qualify as an oscillator measurement, the firmware publishes:
+
+```json
+{
+  "drift_valid": false,
+  "drift_ppm": null
+}
+```
+
+Some external systems may coerce JSON `null` into numeric zero. A zero stored by such a consumer should therefore not be interpreted as a genuine 0 ppm oscillator measurement unless `drift_valid` is also true.
 
 ## Project goal
 

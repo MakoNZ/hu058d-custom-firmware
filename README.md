@@ -33,6 +33,25 @@ The display controller expects a 9-byte time frame once per second:
 
 Normal time frames use command `0x00`. Command `0x02` is used during startup while usable time is not yet available.
 
+## Hardware reverse engineering
+
+The ESP firmware work is now complemented by a hardware reverse-engineering
+track covering the display controller, sensor inputs, display-driver buses, and
+the separate P3 serial header.
+
+Project notes:
+
+- [`docs/hardware.md`](docs/hardware.md) — confirmed hardware facts, reference
+  information, pin/protocol notes, and open questions
+- [`docs/logic-analyser-plan.md`](docs/logic-analyser-plan.md) — repeatable
+  capture plan for ESP/STC, P3, sensors, buttons, and display-driver traffic
+- [`docs/capture-log.md`](docs/capture-log.md) — capture metadata, observations,
+  interpretations, and confidence levels
+
+Raw logic-analyser captures are kept outside Git by default because they can
+become large quickly; useful decoded results and conclusions belong in the
+tracked documentation.
+
 ## Main features
 
 ### Clock and time

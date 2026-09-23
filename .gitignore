@@ -23,3 +23,6 @@ dist/
 # Python cache
 __pycache__/
 *.pyc
+
+# Raw hardware captures
+captures/
